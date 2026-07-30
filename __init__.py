@@ -22,8 +22,9 @@ Lifecycle behavior (prefetch-with-short-wait, background turn sync, and the
 consecutive-failure circuit breaker) follows the bundled ``plugins/memory/mem0``
 provider so the two behave identically from the agent's point of view. One
 addition: the backend is built on a background thread, because ``initialize()``
-runs inline on Hermes's session-startup path and loading a local embedder costs
-~1.5 s. Consumers wait for readiness where it matters instead — prefetch inside
+runs inline on Hermes's session-startup path and building it costs ~1.5 s —
+mostly importing ``qdrant_client`` and ``fastembed``, not the embedding model,
+which is ~200 ms of that. Consumers wait for readiness where it matters instead — prefetch inside
 its existing budget, tool calls and turn sync in their own threads.
 """
 
@@ -47,8 +48,9 @@ _BREAKER_COOLDOWN_SECS = 120
 # leaving mem0_search as the backstop.
 _PREFETCH_WAIT_SECS = 3
 # How long a tool call or a turn sync waits for the backend to finish building.
-# Generous because it only applies while the embedder loads (~1.5 s for
-# fastembed) and the alternative is telling the model memory is unavailable.
+# Generous because it only applies while the backend builds (~1.5 s, mostly
+# Mem0/qdrant-client/fastembed imports) and the alternative is telling the model
+# memory is unavailable.
 _BACKEND_WAIT_SECS = 30
 
 _CLIENT_ERROR_TYPES = ("MemoryNotFoundError", "ValidationError", "ValueError")
@@ -262,10 +264,11 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         self._backend_ready.clear()
         self._init_started = True
         if background:
-            # Building the backend loads the embedder — measured at ~1.5 s for
-            # fastembed's ONNX weights — and Hermes calls initialize() inline on
-            # the session startup path (agent_init.py). Doing it here would stall
-            # every session start by that much. Consumers wait for readiness where
+            # Building the backend costs ~1.5 s — dominated by importing
+            # qdrant_client (~1.25 s, pydantic model construction) and fastembed
+            # (~0.7 s), with the embedding model itself only ~200 ms — and Hermes
+            # calls initialize() inline on the session startup path
+            # (agent_init.py). Doing it here would stall every session start. Consumers wait for readiness where
             # it actually matters: prefetch inside its existing budget, tool calls
             # and turn sync in their own threads.
             self._backend_thread = threading.Thread(
