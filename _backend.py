@@ -219,6 +219,10 @@ _LOCK_ERROR_MARKERS = ("already accessed by another instance", "already accessed
 DEFAULT_LOCK_RETRIES = 5
 DEFAULT_LOCK_BACKOFF = 0.25
 _MAX_LOCK_BACKOFF = 2.0
+# Window used when concurrency.lease_idle_release is switched on. Long enough to
+# span a turn's storage calls (prefetch → tool calls → extraction write), short
+# enough that another process's retry budget outlasts it.
+DEFAULT_LEASE_IDLE_SECONDS = 2.0
 
 
 def is_lock_conflict(exc: BaseException) -> bool:
@@ -326,46 +330,111 @@ class _StoreLease:
     Re-entrant: Mem0's store methods call one another, and an inner lease must
     not close the client an outer one is still using. The lock also serializes
     this process's own storage calls, which QdrantLocal requires anyway.
+
+    Optionally (``concurrency.lease_idle_release``, off by default) the store is
+    kept open for a short idle window after the last call instead of closing
+    immediately, so a whole turn's prefetch, tool calls and extraction write
+    share one open. See :meth:`held` for what that trades away.
     """
 
-    def __init__(self, memory: Any, path: str, *, retries: int, backoff: float):
+    def __init__(
+        self, memory: Any, path: str, *, retries: int, backoff: float,
+        idle_seconds: float = 0.0,
+    ):
         self._memory = memory
         self._path = path
         self._retries = retries
         self._backoff = backoff
+        self._idle = max(0.0, idle_seconds)
         self._lock = threading.RLock()
         self._depth = 0
+        self._open = False
+        self._timer: Optional[threading.Timer] = None
+        # Bumped every time the store is opened. An idle-release timer captures
+        # the value it was scheduled under and does nothing if a later lease has
+        # since reopened the store — otherwise a timer from a previous cycle
+        # could close a client that is in use.
+        self._generation = 0
         self.leases = 0  # observable in tests / debugging
 
     @property
     def path(self) -> str:
         return self._path
 
+    @property
+    def idle_seconds(self) -> float:
+        return self._idle
+
+    def _cancel_timer(self) -> None:
+        timer, self._timer = self._timer, None
+        if timer is not None:
+            timer.cancel()
+
     def release_now(self) -> None:
         """Close the client so other processes can take the directory."""
-        client = getattr(getattr(self._memory, "vector_store", None), "client", None)
-        if client is None:
-            return
-        try:
-            client.close()
-        except Exception as exc:
-            logger.debug("mem0_hermes: closing local store client: %s", exc)
+        with self._lock:
+            self._cancel_timer()
+            self._open = False
+            client = getattr(getattr(self._memory, "vector_store", None), "client", None)
+            if client is None:
+                return
+            try:
+                client.close()
+            except Exception as exc:
+                logger.debug("mem0_hermes: closing local store client: %s", exc)
+
+    def _schedule_release(self) -> None:
+        generation = self._generation
+
+        def _fire() -> None:
+            with self._lock:
+                # Another call may have started, or reopened the store, between
+                # the timer firing and it winning the lock.
+                if self._depth == 0 and self._generation == generation and self._open:
+                    self.release_now()
+
+        self._cancel_timer()
+        timer = threading.Timer(self._idle, _fire)
+        # Daemon: a pending release must never hold up interpreter exit.
+        timer.daemon = True
+        self._timer = timer
+        timer.start()
 
     @contextmanager
     def held(self):
+        """Own the store for one storage call.
+
+        With ``idle_seconds`` at 0 (the default) the store is closed on the way
+        out, so it is unlocked between every call — maximum fairness to other
+        Hermes processes, at the cost of one reopen per call, which grows with
+        the number of stored points.
+
+        With an idle window, the store stays open until the window passes
+        without another call. Consecutive calls then cost nothing extra, but two
+        things become true: another process may wait up to that window (plus its
+        retry backoff) to get in, and the store stays open into the beginning of
+        Mem0's extraction LLM call rather than being released before it.
+        """
         with self._lock:
             if self._depth == 0:
-                self._memory.vector_store.client = _open_local_client(
-                    self._path, retries=self._retries, backoff=self._backoff
-                )
-                self.leases += 1
+                self._cancel_timer()
+                if not self._open:
+                    self._memory.vector_store.client = _open_local_client(
+                        self._path, retries=self._retries, backoff=self._backoff
+                    )
+                    self._open = True
+                    self._generation += 1
+                    self.leases += 1
             self._depth += 1
             try:
                 yield
             finally:
                 self._depth -= 1
                 if self._depth == 0:
-                    self.release_now()
+                    if self._idle > 0:
+                        self._schedule_release()
+                    else:
+                        self.release_now()
 
     def wrap(self, method):
         def leased(*args, **kwargs):
@@ -377,7 +446,9 @@ class _StoreLease:
         return leased
 
 
-def _install_lease(memory: Any, path: str, *, retries: int, backoff: float) -> _StoreLease:
+def _install_lease(
+    memory: Any, path: str, *, retries: int, backoff: float, idle_seconds: float = 0.0,
+) -> _StoreLease:
     """Wrap every public storage method of Mem0's vector store with a lease.
 
     Discovered from the class rather than a hardcoded name list, so a Mem0
@@ -385,7 +456,9 @@ def _install_lease(memory: Any, path: str, *, retries: int, backoff: float) -> _
     calling an unwrapped method between leases fails loudly on the closed
     client instead of corrupting anything.
     """
-    lease = _StoreLease(memory, path, retries=retries, backoff=backoff)
+    lease = _StoreLease(
+        memory, path, retries=retries, backoff=backoff, idle_seconds=idle_seconds,
+    )
     store = memory.vector_store
     for name in dir(type(store)):
         if name.startswith("_"):
@@ -468,7 +541,26 @@ def _concurrency_settings(config: Dict[str, Any]) -> Dict[str, Any]:
         backoff = float(block.get("lock_retry_backoff", DEFAULT_LOCK_BACKOFF))
     except (TypeError, ValueError):
         backoff = DEFAULT_LOCK_BACKOFF
-    return {"lease": bool(lease), "retries": max(0, retries), "backoff": max(0.0, backoff)}
+
+    # Off by default: releasing on every call is the fair behavior, and the
+    # idle window trades some of that fairness for latency on large stores.
+    idle_enabled = block.get("lease_idle_release", False)
+    if isinstance(idle_enabled, str):
+        idle_enabled = idle_enabled.strip().lower() not in ("false", "0", "no", "")
+    idle_seconds = 0.0
+    if idle_enabled:
+        try:
+            idle_seconds = float(block.get("lease_idle_seconds", DEFAULT_LEASE_IDLE_SECONDS))
+        except (TypeError, ValueError):
+            idle_seconds = DEFAULT_LEASE_IDLE_SECONDS
+        idle_seconds = max(0.0, idle_seconds)
+
+    return {
+        "lease": bool(lease),
+        "retries": max(0, retries),
+        "backoff": max(0.0, backoff),
+        "idle_seconds": idle_seconds,
+    }
 
 
 def local_store_path(config: Dict[str, Any]) -> str:
@@ -558,11 +650,20 @@ def build_memory(config: Dict[str, Any]):
         memory._hermes_lease = _install_lease(
             memory, store_path,
             retries=settings["retries"], backoff=settings["backoff"],
+            idle_seconds=settings["idle_seconds"],
         )
-        logger.info(
-            "mem0_hermes: embedded Qdrant at %s is leased per storage call, so "
-            "other Hermes processes can share it", store_path,
-        )
+        if settings["idle_seconds"] > 0:
+            logger.info(
+                "mem0_hermes: embedded Qdrant at %s is leased with a %.1fs idle "
+                "release — consecutive calls share one open, and other Hermes "
+                "processes may wait that long to get in",
+                store_path, settings["idle_seconds"],
+            )
+        else:
+            logger.info(
+                "mem0_hermes: embedded Qdrant at %s is leased per storage call, so "
+                "other Hermes processes can share it", store_path,
+            )
     elif store_path:
         logger.info(
             "mem0_hermes: holding the embedded Qdrant lock at %s for this "
@@ -732,6 +833,14 @@ class HermesRoutedMem0Backend:
         memory = self._memory
         if memory is None:
             return
+        # Before anything else: cancel a pending idle release and drop the OS
+        # lock. Leaving a timer armed would reopen nothing but would fire against
+        # a torn-down store.
+        if self._lease is not None:
+            try:
+                self._lease.release_now()
+            except Exception:
+                pass
         try:
             telemetry = getattr(memory, "telemetry", None)
             posthog = getattr(telemetry, "posthog", None)

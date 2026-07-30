@@ -161,6 +161,8 @@ checkout directory name doesn't matter; the destination is always
   },
   "concurrency": {                 // see "Multiple Hermes processes" below
     "lease_local_store": true,     // release the embedded-Qdrant lock between calls
+    "lease_idle_release": false,   // opt in: hold it briefly instead of per call
+    "lease_idle_seconds": 2.0,
     "lock_retries": 5,
     "lock_retry_backoff": 0.25,
     "sqlite_wal": true,            // defer to Hermes's WAL policy for history.db
@@ -223,7 +225,7 @@ of. Measured on this machine with the fastembed default:
 | `system_prompt_block()` | 0 ms | Never touches the backend |
 | First turn's `prefetch()` | up to the build (~1.5 s), capped at 3 s | Waits for the backend so the first turn still gets recall |
 | Later `prefetch()` | ~22 ms, off the hot path | Started at `on_turn_start`, consumed when the turn needs it |
-| `mem0_add` / `mem0_search` tool call | ~15–25 ms | Runs inline on the agent loop |
+| `mem0_add` / `mem0_search` tool call | ~15–25 ms | Runs inline on the agent loop. Over half of it is reopening the leased store, which grows with the store — see [`lease_idle_release`](#lease_idle_release--paying-the-reopen-once-per-turn) |
 | `sync_turn` (extraction) | 0 ms on the loop | Background thread; the LLM call happens there |
 
 The build isn't free, it's just moved somewhere it overlaps with the user typing
@@ -272,8 +274,32 @@ This plugin handles that in three ways:
    and each call, so a brief overlap waits instead of failing.
 
 Cost of leasing is one store reopen per call: measured ~10 ms at 100 memories,
-~45 ms at 1 000, ~180 ms at 5 000. Set `lease_local_store: false` if you have a
-single process and a large store; QdrantLocal itself warns past 20 000 points.
+~45 ms at 1 000, ~180 ms at 5 000. That cost is per storage call and grows with
+the store, so on a large store it dominates every memory tool call.
+
+### `lease_idle_release` — paying the reopen once per turn
+
+Off by default. When on, the store stays open for `lease_idle_seconds` (2 s)
+after the last storage call instead of closing immediately, so a turn's
+prefetch, tool calls and extraction write share one open:
+
+| Store size | Default | `lease_idle_release: true` |
+| --- | ---: | ---: |
+| ~100 memories | 24.7 ms/add | **9.0 ms/add** |
+| ~1 000 memories | 76.1 ms/add | **9.0 ms/add** |
+
+The per-call cost stops scaling with the store, because there is no reopen.
+What you give up:
+
+- Another Hermes process may wait up to the idle window (plus its retry backoff)
+  to get in, rather than slipping between calls.
+- The store stays open into the *start* of Mem0's extraction LLM call — until
+  the window lapses — instead of being released before it.
+
+So it's the right switch for one busy process with a large store, and the wrong
+one if several Hermes processes are genuinely interleaving. `lease_local_store:
+false` remains the extreme of the same trade: fastest, but the process owns the
+directory for its lifetime.
 
 **What this cannot fix:** a process that holds the directory and never leases —
 the bundled `mem0` plugin, or this plugin with leasing off. Leasing only works

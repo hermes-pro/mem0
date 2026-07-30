@@ -737,6 +737,125 @@ class HistoryDatabaseTests(unittest.TestCase):
             blocker.close()
 
 
+@unittest.skipUnless(
+    _have("mem0") and _have("qdrant_client") and _have("fastembed"),
+    "requires mem0ai + qdrant-client + fastembed",
+)
+class IdleReleaseLeaseTests(unittest.TestCase):
+    """Opt-in: keep the store open briefly between calls instead of per call.
+
+    Reopening embedded Qdrant costs ~10 ms at 100 points and ~180 ms at 5 000,
+    and with the default lease every storage call pays it. The idle window lets
+    a turn's calls share one open, trading away some cross-process fairness —
+    hence off by default.
+    """
+
+    IDLE = 0.4
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.home = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.config = _config.load_config(self.home)
+        install_call_llm(RecordingCallLlm(response=FakeResponse('{"memory": []}')))
+        self.backend = None
+
+    def tearDown(self):
+        if self.backend is not None:
+            self.backend.close()
+
+    def _build(self, **concurrency):
+        config = copy.deepcopy(self.config)
+        config["concurrency"] = dict(config.get("concurrency") or {}, **concurrency)
+        self.backend = _backend.HermesRoutedMem0Backend(config)
+        return self.backend
+
+    def _write(self, text):
+        self.backend.add(
+            [{"role": "user", "content": text}],
+            user_id="u", agent_id="hermes", infer=False,
+        )
+
+    def _foreign_client_opens(self):
+        from qdrant_client import QdrantClient
+
+        try:
+            client = QdrantClient(path=_backend.local_store_path(self.config))
+        except Exception as exc:
+            if _backend.is_lock_conflict(exc):
+                return False
+            raise
+        client.close()
+        return True
+
+    def test_disabled_by_default(self):
+        backend = self._build()
+        self.assertEqual(backend._lease.idle_seconds, 0.0)
+        before = backend.leases
+        self._write("one")
+        self._write("two")
+        # One lease per call, and the store is free immediately afterwards.
+        self.assertEqual(backend.leases - before, 2)
+        self.assertTrue(self._foreign_client_opens())
+
+    def test_consecutive_calls_share_one_open_when_enabled(self):
+        backend = self._build(lease_idle_release=True, lease_idle_seconds=self.IDLE)
+        self.assertEqual(backend._lease.idle_seconds, self.IDLE)
+        before = backend.leases
+        self._write("one")
+        self._write("two")
+        self._write("three")
+        self.assertEqual(
+            backend.leases - before, 1, "expected the three writes to share one open"
+        )
+
+    def test_the_store_is_released_after_the_idle_window(self):
+        backend = self._build(lease_idle_release=True, lease_idle_seconds=self.IDLE)
+        self._write("one")
+        # Still held right after the call — that is the whole point.
+        self.assertFalse(self._foreign_client_opens())
+        time.sleep(self.IDLE * 3)
+        self.assertTrue(
+            self._foreign_client_opens(), "store not released after the idle window"
+        )
+
+    def test_a_call_after_the_window_reopens(self):
+        backend = self._build(lease_idle_release=True, lease_idle_seconds=self.IDLE)
+        before = backend.leases
+        self._write("one")
+        time.sleep(self.IDLE * 3)
+        self._write("two")
+        self.assertEqual(backend.leases - before, 2)
+
+    def test_close_cancels_a_pending_release(self):
+        backend = self._build(lease_idle_release=True, lease_idle_seconds=30)
+        self._write("one")
+        backend.close()
+        self.backend = None
+        self.assertTrue(
+            self._foreign_client_opens(), "close() left the store locked"
+        )
+
+    def test_release_timer_never_blocks_interpreter_exit(self):
+        backend = self._build(lease_idle_release=True, lease_idle_seconds=30)
+        self._write("one")
+        timer = backend._lease._timer
+        self.assertIsNotNone(timer)
+        self.assertTrue(timer.daemon, "a non-daemon timer would delay process exit")
+
+    def test_a_stale_timer_cannot_close_a_reopened_store(self):
+        """Generation guard: a timer from a previous cycle must be inert."""
+        backend = self._build(lease_idle_release=True, lease_idle_seconds=self.IDLE)
+        lease = backend._lease
+        self._write("one")
+        stale = lease._timer
+        lease.release_now()          # cycle ends
+        self._write("two")           # new cycle, store open again
+        stale.function()             # fire the old timer by hand
+        self.assertTrue(lease._open, "a stale timer closed the current store")
+        self._write("three")         # still usable
+
+
 class LockDiagnosticsTests(unittest.TestCase):
     def test_recognizes_qdrants_lock_error(self):
         self.assertTrue(
@@ -755,21 +874,49 @@ class LockDiagnosticsTests(unittest.TestCase):
     def test_concurrency_settings_defaults_and_overrides(self):
         self.assertEqual(
             _backend._concurrency_settings({}),
-            {"lease": True, "retries": 5, "backoff": 0.25},
+            {"lease": True, "retries": 5, "backoff": 0.25, "idle_seconds": 0.0},
         )
         self.assertEqual(
             _backend._concurrency_settings(
                 {"concurrency": {"lease_local_store": "false", "lock_retries": "2",
                                  "lock_retry_backoff": "0.1"}}
             ),
-            {"lease": False, "retries": 2, "backoff": 0.1},
+            {"lease": False, "retries": 2, "backoff": 0.1, "idle_seconds": 0.0},
         )
         # Junk values fall back rather than crashing a session.
         self.assertEqual(
             _backend._concurrency_settings(
                 {"concurrency": {"lock_retries": "many", "lock_retry_backoff": None}}
             ),
-            {"lease": True, "retries": 5, "backoff": 0.25},
+            {"lease": True, "retries": 5, "backoff": 0.25, "idle_seconds": 0.0},
+        )
+
+    def test_idle_release_is_opt_in(self):
+        # The window is ignored entirely unless the flag is on.
+        self.assertEqual(
+            _backend._concurrency_settings(
+                {"concurrency": {"lease_idle_seconds": 9}}
+            )["idle_seconds"],
+            0.0,
+        )
+        self.assertEqual(
+            _backend._concurrency_settings(
+                {"concurrency": {"lease_idle_release": True}}
+            )["idle_seconds"],
+            _backend.DEFAULT_LEASE_IDLE_SECONDS,
+        )
+        self.assertEqual(
+            _backend._concurrency_settings(
+                {"concurrency": {"lease_idle_release": "true", "lease_idle_seconds": "1.5"}}
+            )["idle_seconds"],
+            1.5,
+        )
+        # Junk window with the flag on falls back to the default, not to 0.
+        self.assertEqual(
+            _backend._concurrency_settings(
+                {"concurrency": {"lease_idle_release": True, "lease_idle_seconds": "soon"}}
+            )["idle_seconds"],
+            _backend.DEFAULT_LEASE_IDLE_SECONDS,
         )
 
 

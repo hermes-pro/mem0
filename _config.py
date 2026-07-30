@@ -198,6 +198,13 @@ def default_config(home: Optional[Path] = None) -> Dict[str, Any]:
         # timeout raises SQLite's 5s default ceiling for contended writes.
         "concurrency": {
             "lease_local_store": True,
+            # Off by default. On, the store stays open for lease_idle_seconds
+            # after the last storage call, so a turn's calls share one open
+            # instead of paying a reopen each (that reopen grows with the number
+            # of stored points: ~10 ms at 100, ~180 ms at 5000). The cost is
+            # fairness — another process waits up to that window to get in.
+            "lease_idle_release": False,
+            "lease_idle_seconds": 2.0,
             "lock_retries": 5,
             "lock_retry_backoff": 0.25,
             "sqlite_wal": True,
