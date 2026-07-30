@@ -17,7 +17,10 @@ hermes memory setup                      # pick mem0_hermes, choose an embedder
 `hermes memory setup` installs `mem0ai` plus the embedder you select (the
 default, `fastembed`, needs no API key), writes `memory.provider: mem0_hermes`
 to `config.yaml`, and saves your answers to `$HERMES_HOME/mem0_hermes.json`.  
-Start a new session to activate. Accepting the defaults gets you working memory
+  
+Start a new session to activate.
+  
+Accepting the defaults gets you working memory
 with **no credentials of any kind** — extraction borrows your Hermes provider's
 auth, embeddings run locally.
 
