@@ -19,6 +19,12 @@ class FakeBackend:
 
     routing = "main Hermes model (auxiliary.mem0_hermes_extraction)"
 
+    # The provider acquires backends through _backend.acquire_backend, which
+    # shares one owner per storage path and refcounts it; a double has to carry
+    # that bookkeeping.
+    _share_key = ""
+    _refcount = 0
+
     def __init__(self, config=None, memory=None, results=None, error=None):
         self.config = config
         self.results = results if results is not None else []

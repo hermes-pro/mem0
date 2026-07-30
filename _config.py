@@ -186,6 +186,23 @@ def default_config(home: Optional[Path] = None) -> Dict[str, Any]:
             "provider": "qdrant",
             "config": {"path": str(state / "qdrant"), "collection_name": "mem0_hermes"},
         },
+        # Embedded Qdrant takes an exclusive OS lock on its directory for the
+        # lifetime of the client, so CLI + gateway + Desktop + cron cannot all
+        # hold it. Leasing takes the lock per storage call instead, letting
+        # cooperating Hermes processes share one store. Turn it off for a
+        # single-process setup with a large store (the reopen cost scales with
+        # point count), or point vector_store.config.url at a Qdrant server.
+        # history.db is the other file several Hermes processes open at once.
+        # sqlite_wal defers to hermes_state's policy (WAL where safe, DELETE on
+        # NFS and on SQLite builds with the WAL-reset corruption bug); the busy
+        # timeout raises SQLite's 5s default ceiling for contended writes.
+        "concurrency": {
+            "lease_local_store": True,
+            "lock_retries": 5,
+            "lock_retry_backoff": 0.25,
+            "sqlite_wal": True,
+            "sqlite_busy_timeout_ms": 15000,
+        },
         "history_db_path": str(state / "history.db"),
     }
 

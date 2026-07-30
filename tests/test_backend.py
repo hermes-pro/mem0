@@ -9,12 +9,18 @@ extraction actually runs through the Hermes-routed adapter — it is skipped whe
 
 from __future__ import annotations
 
+import copy
 import importlib.util
+import json
 import os
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
+import _bootstrap
 from _bootstrap import FakeResponse, RecordingCallLlm, install_call_llm
 
 from mem0_hermes import _backend, _config
@@ -328,6 +334,442 @@ class FastembedDefaultTests(unittest.TestCase):
         vector = self.backend.memory.embedding_model.embed("probe", "add")
         self.assertEqual(
             len(vector), self.config["embedder"]["config"]["embedding_dims"]
+        )
+
+
+@unittest.skipUnless(
+    _have("mem0") and _have("qdrant_client") and _have("fastembed"),
+    "requires mem0ai + qdrant-client + fastembed",
+)
+class LocalStoreSharingTests(unittest.TestCase):
+    """Embedded Qdrant allows one live owner per directory; prove we cope.
+
+    The failure being defended against:
+        RuntimeError: Storage folder <path> is already accessed by another
+        instance of Qdrant client.
+    """
+
+    def setUp(self):
+        # ignore_cleanup_errors: a *refused* QdrantLocal lock leaves its .lock
+        # handle open inside qdrant-client until the exception is collected, and
+        # Windows won't delete a file with an open handle. Tests here deliberately
+        # provoke refusals.
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.home = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.config = _config.load_config(self.home)
+        install_call_llm(RecordingCallLlm(response=FakeResponse('{"memory": []}')))
+        self.backends = []
+        self.addCleanup(self._close_all)
+
+    def _close_all(self):
+        for backend in self.backends:
+            try:
+                _backend.release_backend(backend)
+            except Exception:
+                backend.close()
+
+    def _new_backend(self, config=None, shared=False):
+        config = config if config is not None else self.config
+        backend = (
+            _backend.acquire_backend(config)
+            if shared
+            else _backend.HermesRoutedMem0Backend(config)
+        )
+        self.backends.append(backend)
+        return backend
+
+    def _store_path(self):
+        return _backend.local_store_path(self.config)
+
+    def _foreign_client(self):
+        """A second, independent Qdrant client on the same directory."""
+        from qdrant_client import QdrantClient
+
+        return QdrantClient(path=self._store_path())
+
+    def test_lease_is_on_by_default_for_a_local_store(self):
+        backend = self._new_backend()
+        self.assertIsNotNone(backend._lease, "expected a lease for a local path store")
+
+    def test_lock_is_released_between_operations(self):
+        backend = self._new_backend()
+        backend.add(
+            [{"role": "user", "content": "Prefers dark roast"}],
+            user_id="u", agent_id="hermes", infer=False,
+        )
+        # The whole point: another process can now take the directory.
+        foreign = self._foreign_client()
+        try:
+            self.assertTrue(foreign.collection_exists("mem0_hermes"))
+        finally:
+            foreign.close()
+        # And we can still use it afterwards.
+        results = backend.search("coffee", filters={"user_id": "u"}, top_k=5)
+        self.assertTrue(any("dark roast" in (r.get("memory") or "") for r in results))
+
+    def test_each_operation_takes_a_fresh_lease(self):
+        backend = self._new_backend()
+        before = backend.leases
+        backend.search("anything", filters={"user_id": "u"}, top_k=3)
+        self.assertGreater(backend.leases, before)
+
+    def test_two_backends_on_one_directory_both_work(self):
+        # Without leasing, constructing the second one raises.
+        first = self._new_backend()
+        second = self._new_backend()
+        first.add(
+            [{"role": "user", "content": "Fact from the first backend"}],
+            user_id="u", agent_id="hermes", infer=False,
+        )
+        second.add(
+            [{"role": "user", "content": "Fact from the second backend"}],
+            user_id="u", agent_id="hermes", infer=False,
+        )
+        found = " ".join(
+            r.get("memory") or ""
+            for r in first.search("fact", filters={"user_id": "u"}, top_k=10)
+        )
+        self.assertIn("first backend", found)
+        self.assertIn("second backend", found)
+
+    def test_a_brief_foreign_holder_is_waited_out(self):
+        backend = self._new_backend()
+        foreign = self._foreign_client()
+        released = threading.Event()
+
+        def release_soon():
+            time.sleep(0.4)  # shorter than the retry budget
+            foreign.close()
+            released.set()
+
+        thread = threading.Thread(target=release_soon, daemon=True)
+        thread.start()
+        try:
+            # Retries with backoff rather than failing on the first conflict.
+            results = backend.search("anything", filters={"user_id": "u"}, top_k=3)
+            self.assertEqual(results, [])
+            self.assertTrue(released.is_set(), "expected to wait for the holder")
+        finally:
+            thread.join(timeout=5)
+            foreign.close()
+
+    def test_a_permanent_foreign_holder_reports_how_to_fix_it(self):
+        config = copy.deepcopy(self.config)
+        config["concurrency"] = {"lock_retries": 1, "lock_retry_backoff": 0.05}
+        backend = self._new_backend(config)
+        foreign = self._foreign_client()
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                backend.search("anything", filters={"user_id": "u"}, top_k=3)
+            message = str(ctx.exception)
+            self.assertIn("held by another Qdrant client", message)
+            self.assertIn("Qdrant server", message)
+            self.assertIn("Do not delete the .lock file", message)
+        finally:
+            foreign.close()
+
+    def test_lease_can_be_disabled(self):
+        config = copy.deepcopy(self.config)
+        config["concurrency"] = {"lease_local_store": False}
+        backend = self._new_backend(config)
+        self.assertIsNone(backend._lease)
+        # Documents the trade-off: the directory stays locked for the process.
+        with self.assertRaises(RuntimeError) as ctx:
+            self._foreign_client()
+        self.assertTrue(_backend.is_lock_conflict(ctx.exception))
+
+    def test_process_shares_one_owner_per_directory(self):
+        first = self._new_backend(shared=True)
+        second = self._new_backend(shared=True)
+        self.assertIs(first, second)
+        self.assertEqual(first._refcount, 2)
+
+    def test_shared_owner_survives_one_release(self):
+        first = self._new_backend(shared=True)
+        second = _backend.acquire_backend(self.config)
+        _backend.release_backend(second)
+        # Still usable: the remaining holder's store was not closed underneath it.
+        self.assertEqual(first.search("x", filters={"user_id": "u"}, top_k=1), [])
+
+    def test_a_server_url_is_never_leased_or_shared(self):
+        config = copy.deepcopy(self.config)
+        config["vector_store"] = {
+            "provider": "qdrant",
+            "config": {"url": "http://localhost:6333", "collection_name": "mem0_hermes"},
+        }
+        self.assertEqual(_backend.local_store_path(config), "")
+        self.assertEqual(_backend._share_key(config), "")
+
+
+_WORKER = '''
+import importlib.util, json, os, sys, time, types
+repo, home, tag = sys.argv[1], sys.argv[2], sys.argv[3]
+hold_seconds = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
+sys.path.insert(0, os.path.join(repo, "hermes-agent"))
+sys.path.insert(0, repo)
+spec = importlib.util.spec_from_file_location(
+    "mem0_hermes", os.path.join(repo, "__init__.py"), submodule_search_locations=[repo]
+)
+module = importlib.util.module_from_spec(spec)
+sys.modules["mem0_hermes"] = module
+spec.loader.exec_module(module)
+
+# No real model call: stand in for the routed LLM.
+aux = types.ModuleType("agent.auxiliary_client")
+class _Response:
+    def __init__(self):
+        message = types.SimpleNamespace(content='{"memory": []}', tool_calls=None)
+        self.choices = [types.SimpleNamespace(message=message)]
+        self.model = "fake"
+aux.call_llm = lambda **kwargs: _Response()
+sys.modules["agent.auxiliary_client"] = aux
+
+from mem0_hermes import _backend, _config
+backend = _backend.HermesRoutedMem0Backend(_config.load_config(home))
+try:
+    if hold_seconds:
+        # Hold the store open, as a non-leasing owner would.
+        print("READY", flush=True)
+        time.sleep(hold_seconds)
+        print(json.dumps({"tag": tag, "held": hold_seconds}))
+        raise SystemExit(0)
+    for index in range(4):
+        backend.add(
+            [{"role": "user", "content": f"{tag} fact {index}"}],
+            user_id="u", agent_id="hermes", infer=False,
+        )
+        hits = backend.search("fact", filters={"user_id": "u"}, top_k=50)
+        time.sleep(0.05)
+    print(json.dumps({"tag": tag, "leases": backend.leases, "visible": len(hits)}))
+finally:
+    backend.close()
+'''
+
+
+@unittest.skipUnless(
+    _have("mem0") and _have("qdrant_client") and _have("fastembed"),
+    "requires mem0ai + qdrant-client + fastembed",
+)
+class CrossProcessStoreTests(unittest.TestCase):
+    """Two OS processes on one embedded store — the reported failure.
+
+    Slowest test in the suite: it spawns two interpreters that each load Mem0
+    and fastembed. It earns that by covering what in-process tests cannot —
+    a genuinely separate process holding the same directory.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.home = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.worker = self.home / "worker.py"
+        self.worker.write_text(_WORKER, encoding="utf-8")
+
+    def _run_pair(self):
+        import subprocess
+
+        repo = str(_bootstrap.REPO_ROOT)
+        env = dict(os.environ, MEM0_HERMES_NO_INSTALL="1")
+        procs = [
+            subprocess.Popen(
+                [sys.executable, str(self.worker), repo, str(self.home), tag],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+            )
+            for tag in ("A", "B")
+        ]
+        return [proc.communicate(timeout=180) + (proc.returncode,) for proc in procs]
+
+    def test_two_processes_share_the_store_when_leasing(self):
+        results = self._run_pair()
+        for stdout, stderr, code in results:
+            self.assertEqual(code, 0, f"worker failed:\n{stderr}")
+            self.assertNotIn("already accessed by another instance", stderr)
+        payloads = [json.loads(stdout.strip().splitlines()[-1]) for stdout, _e, _c in results]
+        for payload in payloads:
+            self.assertGreater(payload["leases"], 0, payload)
+        # At least one process must observe the other's writes, which is only
+        # possible because each lease reopens the store instead of holding a
+        # snapshot for its lifetime.
+        self.assertTrue(any(p["visible"] > 4 for p in payloads), payloads)
+
+    def test_a_non_leasing_process_locks_everyone_out_with_a_clear_message(self):
+        """The case leasing cannot fix, reported so the user can act.
+
+        A process that holds the directory and never leases — the bundled
+        ``mem0`` plugin, or this plugin with ``lease_local_store: false`` —
+        keeps the lock for its lifetime. Nothing this plugin does can share it,
+        so the requirement is that the error names the cause and the fix.
+        """
+        import subprocess
+
+        (self.home / "mem0_hermes.json").write_text(
+            json.dumps({"concurrency": {"lease_local_store": False}}), encoding="utf-8"
+        )
+        env = dict(os.environ, MEM0_HERMES_NO_INSTALL="1")
+        holder = subprocess.Popen(
+            [sys.executable, str(self.worker), str(_bootstrap.REPO_ROOT),
+             str(self.home), "HOLDER", "20"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )
+        try:
+            # Wait until the other process actually owns the directory.
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                line = holder.stdout.readline()
+                if line.strip() == "READY":
+                    break
+                if holder.poll() is not None:
+                    self.fail(f"holder exited early: {holder.stderr.read()}")
+            else:
+                self.fail("holder never became ready")
+
+            config = _config.load_config(self.home)
+            config["concurrency"] = {"lock_retries": 1, "lock_retry_backoff": 0.05}
+            with self.assertRaises(RuntimeError) as ctx:
+                _backend.HermesRoutedMem0Backend(config)
+            message = str(ctx.exception)
+            self.assertIn("held by another Qdrant client", message)
+            self.assertIn("Qdrant server", message)
+            self.assertIn("Do not delete the .lock file", message)
+        finally:
+            holder.kill()
+            holder.communicate(timeout=30)
+
+
+@unittest.skipUnless(
+    _have("mem0") and _have("qdrant_client") and _have("fastembed"),
+    "requires mem0ai + qdrant-client + fastembed",
+)
+class HistoryDatabaseTests(unittest.TestCase):
+    """Mem0's history.db is opened by every Hermes process too."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.home = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.config = _config.load_config(self.home)
+        install_call_llm(RecordingCallLlm(response=FakeResponse('{"memory": []}')))
+        self.backend = None
+
+    def tearDown(self):
+        if self.backend is not None:
+            self.backend.close()
+
+    def _build(self, concurrency=None):
+        config = copy.deepcopy(self.config)
+        if concurrency is not None:
+            config["concurrency"] = concurrency
+        self.backend = _backend.HermesRoutedMem0Backend(config)
+        return self.backend
+
+    def _pragma(self, name):
+        return self.backend.memory.db.connection.execute(f"PRAGMA {name}").fetchone()[0]
+
+    def test_busy_timeout_is_raised_above_sqlites_default(self):
+        self._build()
+        # SQLite's own default is 5000 ms, which is a hard cliff for a
+        # contended write; past it the memory operation fails outright.
+        self.assertEqual(self._pragma("busy_timeout"), 15000)
+
+    def test_busy_timeout_is_configurable(self):
+        self._build({"sqlite_busy_timeout_ms": 250})
+        self.assertEqual(self._pragma("busy_timeout"), 250)
+
+    def test_junk_timeout_falls_back_to_the_default(self):
+        self._build({"sqlite_busy_timeout_ms": "soon"})
+        self.assertEqual(
+            self._pragma("busy_timeout"), _backend.DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+        )
+
+    def test_journal_mode_follows_hermes_policy(self):
+        """Never enable WAL where Hermes itself refuses to."""
+        try:
+            from hermes_state import is_sqlite_wal_reset_vulnerable
+        except ImportError:
+            self.skipTest("hermes_state unavailable")
+        self._build()
+        mode = str(self._pragma("journal_mode")).lower()
+        if is_sqlite_wal_reset_vulnerable():
+            # This SQLite build can corrupt multi-process WAL databases.
+            self.assertNotEqual(mode, "wal", "WAL enabled on a vulnerable build")
+        else:
+            self.assertEqual(mode, "wal")
+
+    def test_wal_can_be_declined_entirely(self):
+        self._build({"sqlite_wal": False, "sqlite_busy_timeout_ms": 1000})
+        self.assertEqual(self._pragma("busy_timeout"), 1000)
+
+    def test_timeout_decides_whether_a_contended_write_survives(self):
+        """The knob has to actually change behaviour, not just report a value."""
+        import sqlite3
+
+        # A short ceiling gives up while another connection holds the write lock.
+        self._build({"sqlite_busy_timeout_ms": 100})
+        db_path = self.config["history_db_path"]
+        # check_same_thread=False: the releasing thread below has to be able to
+        # roll this back, or the "holder releases" half of the test silently
+        # never releases and both halves fail for the wrong reason.
+        blocker = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+        try:
+            blocker.execute("BEGIN EXCLUSIVE")
+            with self.assertRaises(sqlite3.OperationalError) as ctx:
+                self.backend.memory.db.add_history("m1", None, "fact", "ADD")
+            self.assertIn("locked", str(ctx.exception).lower())
+
+            # A ceiling longer than the hold rides it out instead.
+            self.backend.memory.db.connection.execute("PRAGMA busy_timeout=4000")
+            released = threading.Event()
+
+            def release():
+                time.sleep(0.5)
+                blocker.rollback()
+                released.set()
+
+            thread = threading.Thread(target=release, daemon=True)
+            thread.start()
+            try:
+                self.backend.memory.db.add_history("m2", None, "fact", "ADD")
+                self.assertTrue(released.is_set())
+            finally:
+                thread.join(timeout=10)
+        finally:
+            blocker.close()
+
+
+class LockDiagnosticsTests(unittest.TestCase):
+    def test_recognizes_qdrants_lock_error(self):
+        self.assertTrue(
+            _backend.is_lock_conflict(
+                RuntimeError(
+                    "Storage folder /x is already accessed by another instance of "
+                    "Qdrant client. If you require concurrent access, use Qdrant "
+                    "server instead."
+                )
+            )
+        )
+
+    def test_ignores_unrelated_errors(self):
+        self.assertFalse(_backend.is_lock_conflict(RuntimeError("disk full")))
+
+    def test_concurrency_settings_defaults_and_overrides(self):
+        self.assertEqual(
+            _backend._concurrency_settings({}),
+            {"lease": True, "retries": 5, "backoff": 0.25},
+        )
+        self.assertEqual(
+            _backend._concurrency_settings(
+                {"concurrency": {"lease_local_store": "false", "lock_retries": "2",
+                                 "lock_retry_backoff": "0.1"}}
+            ),
+            {"lease": False, "retries": 2, "backoff": 0.1},
+        )
+        # Junk values fall back rather than crashing a session.
+        self.assertEqual(
+            _backend._concurrency_settings(
+                {"concurrency": {"lock_retries": "many", "lock_retry_backoff": None}}
+            ),
+            {"lease": True, "retries": 5, "backoff": 0.25},
         )
 
 
