@@ -7,6 +7,29 @@ Hermes's auxiliary model path instead of the OpenAI API** — so fact extraction
 runs on whatever `hermes model` points at, including OAuth-only backends like
 Codex that have no API key for Mem0 to use in the first place.
 
+## Install
+
+```bash
+hermes plugins install hermes-pro/mem0 --no-enable
+hermes memory setup                      # pick mem0_hermes, choose an embedder
+```
+
+`hermes memory setup` installs `mem0ai` plus the embedder you select (the
+default, `fastembed`, needs no API key), writes `memory.provider: mem0_hermes`
+to `config.yaml`, and saves your answers to `$HERMES_HOME/mem0_hermes.json`.
+Start a new session to activate. Accepting the defaults gets you working memory
+with **no credentials of any kind** — extraction borrows your Hermes provider's
+auth, embeddings run locally.
+
+## Updating and removing:
+
+```bash
+hermes plugins update mem0_hermes        # git pull in place
+hermes plugins remove mem0_hermes
+```
+
+## Notes
+
 Mem0's OSS engine is good at the memory part — semantic search, dedup, an
 add/update/delete decision pass — but every LLM call it makes goes through its
 own `openai.OpenAI` client to `api.openai.com`, keyed off `OPENAI_API_KEY`. On
@@ -72,42 +95,6 @@ under `$HERMES_HOME`, which `hermes backup` archives. Set
 
 Everything else — the vector store, the history DB — is local by default under
 `$HERMES_HOME/mem0_hermes/`.
-
-## Install
-
-```bash
-hermes plugins install hermes-pro/mem0 --no-enable
-hermes memory setup                      # pick mem0_hermes, choose an embedder
-```
-
-`hermes memory setup` installs `mem0ai` plus the embedder you select (the
-default, `fastembed`, needs no API key), writes `memory.provider: mem0_hermes`
-to `config.yaml`, and saves your answers to `$HERMES_HOME/mem0_hermes.json`.
-Start a new session to activate. Accepting the defaults gets you working memory
-with **no credentials of any kind** — extraction borrows your Hermes provider's
-auth, embeddings run locally.
-
-**Why `--no-enable`.** `hermes plugins install` ends with
-`Enable 'mem0_hermes' now? [y/N]`, which manages the `plugins.enabled`
-allow-list. Memory providers don't use that allow-list — they're all
-discovered, and exactly one is activated by `memory.provider` — so the answer
-has no effect either way; `--no-enable` just skips the prompt and keeps the
-allow-list free of an entry that does nothing. `--enable` is equally harmless.
-Nothing else is prompted: this plugin declares no `requires_env`, because it
-needs no credentials of its own.
-
-The repo is named `mem0` but installs as **`mem0_hermes`** — the destination
-comes from `name` in `plugin.yaml`, not the repo. That distinction matters:
-Hermes resolves `memory.provider` against bundled providers first, so a
-provider directory named `mem0` would be shadowed by the bundled Mem0 plugin
-and never load.
-
-Updating and removing:
-
-```bash
-hermes plugins update mem0_hermes        # git pull in place
-hermes plugins remove mem0_hermes
-```
 
 ### Development install
 
