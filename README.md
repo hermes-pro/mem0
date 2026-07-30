@@ -221,7 +221,7 @@ of. Measured on this machine with the fastembed default:
 
 | Path | Cost | Notes |
 | --- | --- | --- |
-| `initialize()` | **2 ms** | The backend builds on a background thread. Building it inline costs ~1 511 ms, almost all of it loading the embedder's ONNX weights |
+| `initialize()` | **2 ms** | The backend builds on a background thread. Building it inline costs ~1 511 ms — mostly *importing* `qdrant_client` (1 252 ms, almost all of it pydantic model construction) and `fastembed` (693 ms). Loading the embedding model itself is only ~199 ms, and the tokenizer inside it ~15 ms |
 | `system_prompt_block()` | 0 ms | Never touches the backend |
 | First turn's `prefetch()` | up to the build (~1.5 s), capped at 3 s | Waits for the backend so the first turn still gets recall |
 | Later `prefetch()` | ~22 ms, off the hot path | Started at `on_turn_start`, consumed when the turn needs it |
