@@ -40,15 +40,35 @@ its `Auxiliary <task>: using <provider> (<model>)` log line.
 ## What still leaves Hermes
 
 **Embeddings.** Hermes has no embedding path of its own, so the `embedder` block
-is handed to Mem0 verbatim. The default is OpenAI's `text-embedding-3-small`
-(what the bundled plugin uses). For zero third-party calls, pick a local
-embedder during setup:
+is handed to Mem0 verbatim — it can't ride the auxiliary route. The default is
+therefore **local**: a keyless default matters most for exactly the users this
+plugin is for, since a Codex/OAuth setup has no `OPENAI_API_KEY` to fall back on.
 
 | `embedder.provider` | Needs | Notes |
 | --- | --- | --- |
-| `fastembed` | `pip install fastembed` | Local ONNX, no server, no key |
+| **`fastembed`** | nothing | **Default.** ONNX in-process; `BAAI/bge-small-en-v1.5`, 384 dims, 67 MB of weights on first use. Nothing leaves the machine |
 | `ollama` | a running Ollama | `nomic-embed-text`, 768 dims |
-| `openai` | `OPENAI_API_KEY` | Default; embeddings only, never generation |
+| `openai` | `OPENAI_API_KEY` | `text-embedding-3-small`; embeddings only, never generation |
+| `huggingface`, `azure_openai`, `gemini`, `lmstudio`, `together`, `aws_bedrock` | varies | Passed through to Mem0 |
+
+`hermes memory setup` installs whichever embedder you pick, at the moment you
+pick it — `fastembed` pulls `fastembed>=0.3.1` (matching mem0ai's own `extras`
+constraint), `ollama` pulls `ollama`, `huggingface` pulls
+`sentence-transformers`. Hosted embedders need no package. The install goes
+through Hermes's own gated installer, so it honors
+`security.allow_lazy_installs` and the durable-target redirect on sealed images.
+Installing fastembed also switches Mem0's BM25 keyword search on, which it
+otherwise skips.
+
+Vector widths are read back from fastembed's own model registry after install
+and written into the config, so a wrong dimension can never silently create a
+mis-sized collection.
+
+fastembed's weights are cached in `%LOCALAPPDATA%\fastembed` (Windows) or
+`~/.cache/fastembed` — not in fastembed's default temp directory, where a disk
+cleanup would delete them and trigger a silent re-download, and deliberately not
+under `$HERMES_HOME`, which `hermes backup` archives. Set
+`FASTEMBED_CACHE_PATH` yourself to override.
 
 Everything else — the vector store, the history DB — is local by default under
 `$HERMES_HOME/mem0_hermes/`.
@@ -60,9 +80,12 @@ hermes plugins install hermes-pro/mem0 --no-enable
 hermes memory setup                      # pick mem0_hermes, choose an embedder
 ```
 
-`hermes memory setup` installs `mem0ai`, writes `memory.provider: mem0_hermes`
+`hermes memory setup` installs `mem0ai` plus the embedder you select (the
+default, `fastembed`, needs no API key), writes `memory.provider: mem0_hermes`
 to `config.yaml`, and saves your answers to `$HERMES_HOME/mem0_hermes.json`.
-Start a new session to activate.
+Start a new session to activate. Accepting the defaults gets you working memory
+with **no credentials of any kind** — extraction borrows your Hermes provider's
+auth, embeddings run locally.
 
 **Why `--no-enable`.** `hermes plugins install` ends with
 `Enable 'mem0_hermes' now? [y/N]`, which manages the `plugins.enabled`
@@ -127,9 +150,9 @@ checkout directory name doesn't matter; the destination is always
     "json_mode": "prompt"          // prompt | response_format | off
   },
 
-  "embedder": {                    // passed to Mem0 as-is
-    "provider": "openai",
-    "config": { "model": "text-embedding-3-small", "embedding_dims": 1536 }
+  "embedder": {                    // passed to Mem0 as-is; local by default
+    "provider": "fastembed",
+    "config": { "model": "BAAI/bge-small-en-v1.5", "embedding_dims": 384 }
   },
   "vector_store": {                // passed to Mem0 as-is
     "provider": "qdrant",
@@ -224,7 +247,9 @@ it replaces.
 
 | Symptom | Cause / fix |
 | --- | --- |
-| `backend not initialized: embedder provider 'openai' needs OPENAI_API_KEY` | Embeddings don't route through Hermes. Set the key, or `hermes memory setup` → embedder `fastembed`/`ollama`. |
+| `backend not initialized: embedder provider 'openai' needs OPENAI_API_KEY` | You switched off the local default. Set the key, or `hermes memory setup` → embedder `fastembed`. |
+| `embedder 'fastembed' needs fastembed>=0.3.1` | Its package went missing — usually a rebuilt venv after `hermes update`. The next session reinstalls it automatically; if installs are gated off (`security.allow_lazy_installs: false`), `pip install fastembed` or re-run `hermes memory setup`. |
+| `fastembed does not offer model '…'` | Typo in `embedder.config.model`. The message lists valid names; setup checks this against fastembed's registry. |
 | `Hermes-routed memory LLM call failed …` | The routed provider rejected the call. The message includes the route; check `hermes model`. |
 | `… returned an empty response` | The model produced nothing (often a reasoning model that spent its budget). Raise `llm.max_tokens` or pin a different `llm.model`. |
 | `circuit breaker tripped after 5 consecutive failures` | Five failures in a row pause memory calls for 120s. Check the routed model and the vector store. |

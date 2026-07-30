@@ -76,13 +76,19 @@ class ProviderTestCase(unittest.TestCase):
         os.environ["HERMES_HOME"] = str(self.home)
         self.addCleanup(self._restore_home)
         # A local embedder needs no API key, so the credential gate is open.
+        # Name the small default model explicitly: if a test ever reaches a real
+        # backend build, a missing model would send Mem0's FastEmbedEmbedding to
+        # its own default (thenlper/gte-large) and download 1.3 GB of weights.
         (self.home / "mem0_hermes.json").write_text(
             json.dumps(
                 {
                     "user_id": "tester",
                     "embedder": {
                         "provider": "fastembed",
-                        "config": {"model": "thenlper/gte-large"},
+                        "config": {
+                            "model": "BAAI/bge-small-en-v1.5",
+                            "embedding_dims": 384,
+                        },
                     },
                 }
             ),
