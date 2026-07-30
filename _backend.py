@@ -552,6 +552,7 @@ def build_memory(config: Dict[str, Any]):
     logger.info(
         "mem0_hermes: memory extraction routed through %s", routed_config.describe(),
     )
+    _prepare_history_db(memory, config)
 
     if store_path and settings["lease"] and getattr(memory.vector_store, "is_local", False):
         memory._hermes_lease = _install_lease(
@@ -568,6 +569,71 @@ def build_memory(config: Dict[str, Any]):
             "process's lifetime (concurrency.lease_local_store is off)", store_path,
         )
     return memory
+
+
+DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 15_000
+
+
+def _prepare_history_db(memory: Any, config: Dict[str, Any]) -> str:
+    """Make Mem0's history DB tolerate other Hermes processes.
+
+    ``history.db`` is the second thing several Hermes processes open at once,
+    and Mem0 connects with ``sqlite3.connect(path, check_same_thread=False)``
+    and nothing else. Two defaults come with that:
+
+    * **A 5 s busy timeout.** Mem0's writes are short (``BEGIN`` → one INSERT →
+      ``COMMIT``), so contention is normally absorbed — measured here at 1200
+      writes across 3 processes with zero failures, worst single wait 549 ms.
+      But 5 s is a hard cliff: past it the write raises and takes the whole
+      memory operation with it. Raising the ceiling costs nothing when
+      uncontended.
+    * **Rollback journalling**, where a writer blocks readers for the length of
+      the write.
+
+    Journal mode is delegated to ``hermes_state.apply_wal_with_fallback`` rather
+    than setting ``PRAGMA journal_mode=WAL`` here, so this database follows the
+    same policy Hermes applies to its own ``state.db``: WAL where it helps,
+    DELETE on filesystems that reject WAL (NFS/SMB/FUSE), and — importantly on
+    the SQLite shipped with this venv — *no* WAL on library builds carrying the
+    WAL-reset corruption bug (3.7.0–3.51.2, fixed in 3.51.3 / 3.50.7 / 3.44.6).
+    Enabling WAL ourselves would hand multi-process users a corruption risk
+    Hermes deliberately refuses elsewhere.
+
+    Returns the journal mode in force, or ``""`` when nothing could be applied.
+    """
+    connection = getattr(getattr(memory, "db", None), "connection", None)
+    if connection is None:
+        return ""
+
+    settings = config.get("concurrency")
+    settings = settings if isinstance(settings, dict) else {}
+    try:
+        timeout_ms = int(settings.get("sqlite_busy_timeout_ms", DEFAULT_SQLITE_BUSY_TIMEOUT_MS))
+    except (TypeError, ValueError):
+        timeout_ms = DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+    timeout_ms = max(0, timeout_ms)
+
+    try:
+        connection.execute(f"PRAGMA busy_timeout={timeout_ms}")
+    except Exception as exc:
+        logger.debug("mem0_hermes: could not set history busy_timeout: %s", exc)
+
+    mode = ""
+    if settings.get("sqlite_wal", True):
+        try:
+            from hermes_state import apply_wal_with_fallback  # type: ignore
+
+            mode = apply_wal_with_fallback(connection, db_label="mem0_hermes history.db")
+        except ImportError:
+            logger.debug("mem0_hermes: hermes_state unavailable; leaving journal mode as-is")
+        except Exception as exc:
+            # Never fatal: the store works in any journal mode.
+            logger.warning("mem0_hermes: history journal mode unchanged: %s", exc)
+    if mode:
+        logger.debug(
+            "mem0_hermes: history.db journal=%s busy_timeout=%dms", mode, timeout_ms
+        )
+    return mode
 
 
 def _unwrap_results(response: Any) -> List[dict]:

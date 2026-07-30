@@ -162,7 +162,9 @@ checkout directory name doesn't matter; the destination is always
   "concurrency": {                 // see "Multiple Hermes processes" below
     "lease_local_store": true,     // release the embedded-Qdrant lock between calls
     "lock_retries": 5,
-    "lock_retry_backoff": 0.25
+    "lock_retry_backoff": 0.25,
+    "sqlite_wal": true,            // defer to Hermes's WAL policy for history.db
+    "sqlite_busy_timeout_ms": 15000
   },
   "history_db_path": "<HERMES_HOME>/mem0_hermes/history.db",
   "custom_instructions": null      // extra guidance for fact extraction
@@ -262,6 +264,30 @@ concurrency.
 not on the file; deleting it while a process holds the store permits concurrent
 writers and real corruption. Close the other process instead.
 
+### The history database
+
+`history.db` (Mem0's record of memory changes) is the other file every process
+opens. Mem0 connects with `sqlite3.connect(path, check_same_thread=False)` and
+nothing more, which leaves two defaults in place:
+
+- **A 5 s busy timeout.** Mem0's writes are short — `BEGIN`, one INSERT,
+  `COMMIT` — so contention is normally absorbed; measured here at 1 200 writes
+  across 3 processes with zero failures and a 549 ms worst case. But 5 s is a
+  cliff: past it the write raises and takes the memory operation with it. Raised
+  to 15 s (`concurrency.sqlite_busy_timeout_ms`), which costs nothing
+  uncontended.
+- **Journal mode**, which decides whether a writer blocks readers.
+
+Journal mode is delegated to Hermes's own `hermes_state.apply_wal_with_fallback`
+rather than set here, so this database follows the same policy as Hermes's
+`state.db`: WAL where it helps, DELETE on filesystems that reject WAL (NFS, SMB,
+some FUSE), and **no WAL on SQLite builds carrying the WAL-reset corruption bug**
+(3.7.0–3.51.2; fixed in 3.51.3, backported to 3.50.7 and 3.44.6). On such a build
+you'll see one warning per process and `journal_mode=delete` — enabling WAL
+ourselves would hand multi-process users a corruption risk Hermes deliberately
+refuses elsewhere. `hermes update` can repair the embedded runtime;
+`concurrency.sqlite_wal: false` opts out of touching journal mode at all.
+
 ### Reranking (advanced)
 
 A `reranker` block is passed to Mem0 verbatim. Mem0 builds LLM rerankers with
@@ -310,6 +336,8 @@ it replaces.
 | `embedder 'fastembed' needs fastembed>=0.3.1` | Its package went missing — usually a rebuilt venv after `hermes update`. The next session reinstalls it automatically; if installs are gated off (`security.allow_lazy_installs: false`), `pip install fastembed` or re-run `hermes memory setup`. |
 | `fastembed does not offer model '…'` | Typo in `embedder.config.model`. The message lists valid names; setup checks this against fastembed's registry. |
 | `the local Qdrant store at … is held by another Qdrant client` | Another process owns the embedded store and isn't releasing it — often the bundled `mem0` plugin, or a Hermes instance with `lease_local_store: false`. Close it, or move to a Qdrant server. See [Multiple Hermes processes](#multiple-hermes-processes). Don't delete `.lock`. |
+| `sqlite3.OperationalError: database is locked` | A history write waited past `concurrency.sqlite_busy_timeout_ms` (15 s). Something is holding a long write transaction on `history.db` — look for a stuck process rather than raising the timeout further. |
+| `linked SQLite … is vulnerable to the WAL-reset corruption bug` | Informational, once per process: WAL was declined and `journal_mode=delete` used instead. `hermes update` repairs the embedded runtime. |
 | `Hermes-routed memory LLM call failed …` | The routed provider rejected the call. The message includes the route; check `hermes model`. |
 | `… returned an empty response` | The model produced nothing (often a reasoning model that spent its budget). Raise `llm.max_tokens` or pin a different `llm.model`. |
 | `circuit breaker tripped after 5 consecutive failures` | Five failures in a row pause memory calls for 120s. Check the routed model and the vector store. |

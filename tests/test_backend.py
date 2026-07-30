@@ -637,6 +637,106 @@ class CrossProcessStoreTests(unittest.TestCase):
             holder.communicate(timeout=30)
 
 
+@unittest.skipUnless(
+    _have("mem0") and _have("qdrant_client") and _have("fastembed"),
+    "requires mem0ai + qdrant-client + fastembed",
+)
+class HistoryDatabaseTests(unittest.TestCase):
+    """Mem0's history.db is opened by every Hermes process too."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.home = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.config = _config.load_config(self.home)
+        install_call_llm(RecordingCallLlm(response=FakeResponse('{"memory": []}')))
+        self.backend = None
+
+    def tearDown(self):
+        if self.backend is not None:
+            self.backend.close()
+
+    def _build(self, concurrency=None):
+        config = copy.deepcopy(self.config)
+        if concurrency is not None:
+            config["concurrency"] = concurrency
+        self.backend = _backend.HermesRoutedMem0Backend(config)
+        return self.backend
+
+    def _pragma(self, name):
+        return self.backend.memory.db.connection.execute(f"PRAGMA {name}").fetchone()[0]
+
+    def test_busy_timeout_is_raised_above_sqlites_default(self):
+        self._build()
+        # SQLite's own default is 5000 ms, which is a hard cliff for a
+        # contended write; past it the memory operation fails outright.
+        self.assertEqual(self._pragma("busy_timeout"), 15000)
+
+    def test_busy_timeout_is_configurable(self):
+        self._build({"sqlite_busy_timeout_ms": 250})
+        self.assertEqual(self._pragma("busy_timeout"), 250)
+
+    def test_junk_timeout_falls_back_to_the_default(self):
+        self._build({"sqlite_busy_timeout_ms": "soon"})
+        self.assertEqual(
+            self._pragma("busy_timeout"), _backend.DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+        )
+
+    def test_journal_mode_follows_hermes_policy(self):
+        """Never enable WAL where Hermes itself refuses to."""
+        try:
+            from hermes_state import is_sqlite_wal_reset_vulnerable
+        except ImportError:
+            self.skipTest("hermes_state unavailable")
+        self._build()
+        mode = str(self._pragma("journal_mode")).lower()
+        if is_sqlite_wal_reset_vulnerable():
+            # This SQLite build can corrupt multi-process WAL databases.
+            self.assertNotEqual(mode, "wal", "WAL enabled on a vulnerable build")
+        else:
+            self.assertEqual(mode, "wal")
+
+    def test_wal_can_be_declined_entirely(self):
+        self._build({"sqlite_wal": False, "sqlite_busy_timeout_ms": 1000})
+        self.assertEqual(self._pragma("busy_timeout"), 1000)
+
+    def test_timeout_decides_whether_a_contended_write_survives(self):
+        """The knob has to actually change behaviour, not just report a value."""
+        import sqlite3
+
+        # A short ceiling gives up while another connection holds the write lock.
+        self._build({"sqlite_busy_timeout_ms": 100})
+        db_path = self.config["history_db_path"]
+        # check_same_thread=False: the releasing thread below has to be able to
+        # roll this back, or the "holder releases" half of the test silently
+        # never releases and both halves fail for the wrong reason.
+        blocker = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+        try:
+            blocker.execute("BEGIN EXCLUSIVE")
+            with self.assertRaises(sqlite3.OperationalError) as ctx:
+                self.backend.memory.db.add_history("m1", None, "fact", "ADD")
+            self.assertIn("locked", str(ctx.exception).lower())
+
+            # A ceiling longer than the hold rides it out instead.
+            self.backend.memory.db.connection.execute("PRAGMA busy_timeout=4000")
+            released = threading.Event()
+
+            def release():
+                time.sleep(0.5)
+                blocker.rollback()
+                released.set()
+
+            thread = threading.Thread(target=release, daemon=True)
+            thread.start()
+            try:
+                self.backend.memory.db.add_history("m2", None, "fact", "ADD")
+                self.assertTrue(released.is_set())
+            finally:
+                thread.join(timeout=10)
+        finally:
+            blocker.close()
+
+
 class LockDiagnosticsTests(unittest.TestCase):
     def test_recognizes_qdrants_lock_error(self):
         self.assertTrue(

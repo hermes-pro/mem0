@@ -101,6 +101,10 @@ A few constraints aren't obvious from reading a single file:
   that opens `QdrantClient(path=...)` without `_open_local_client` (it needs the
   retry, and it must not leak the refused `.lock` handle), and don't hold a lease
   across an LLM call.
+- **Don't set `journal_mode=WAL` yourself.** `history.db` goes through
+  `hermes_state.apply_wal_with_fallback`, which knows about WAL-hostile
+  filesystems and about SQLite builds carrying the WAL-reset corruption bug.
+  Hard-coding WAL would enable it exactly where Hermes refuses to.
 - **Don't route embeddings through `call_llm`.** Hermes has no embedding path;
   the `embedder` block is Mem0's to handle. If that changes upstream, that's a
   feature, not a refactor.
