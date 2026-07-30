@@ -248,8 +248,8 @@ class Mem0HermesMemoryProvider(MemoryProvider):
             self._atexit_registered = True
 
     def _create_backend(self):
+        from . import _backend as backend_mod
         from . import _config as cfgmod
-        from ._backend import HermesRoutedMem0Backend
 
         missing = cfgmod.embedder_key_missing(self._config)
         if missing:
@@ -264,7 +264,10 @@ class Mem0HermesMemoryProvider(MemoryProvider):
             return None
 
         try:
-            return HermesRoutedMem0Backend(self._config)
+            # Shared per storage path within this process: embedded Qdrant
+            # allows one live owner per directory, and a gateway can build
+            # several providers.
+            return backend_mod.acquire_backend(self._config)
         except Exception as exc:
             self._init_error = str(exc)
             logger.error("mem0_hermes: backend failed to initialize: %s", exc)
@@ -272,7 +275,13 @@ class Mem0HermesMemoryProvider(MemoryProvider):
 
     def _shutdown_backend(self) -> None:
         backend, self._backend = self._backend, None
-        if backend is not None:
+        if backend is None:
+            return
+        try:
+            from . import _backend as backend_mod
+
+            backend_mod.release_backend(backend)
+        except Exception:
             try:
                 backend.close()
             except Exception:

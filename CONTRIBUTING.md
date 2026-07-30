@@ -94,6 +94,13 @@ A few constraints aren't obvious from reading a single file:
   `tools.lazy_deps.install_specs` and lift that guard for their duration — see
   `EmbedderDependencyTests`. Never point a test at an embedder whose package
   isn't already present.
+- **Embedded Qdrant allows one live owner per directory.** Everything touching
+  `memory.vector_store` has to go through the lease in `_backend.py`
+  (`_install_lease` wraps the store's public methods) so the OS lock is held per
+  call, not for the process's lifetime. Two rules follow: don't add a code path
+  that opens `QdrantClient(path=...)` without `_open_local_client` (it needs the
+  retry, and it must not leak the refused `.lock` handle), and don't hold a lease
+  across an LLM call.
 - **Don't route embeddings through `call_llm`.** Hermes has no embedding path;
   the `embedder` block is Mem0's to handle. If that changes upstream, that's a
   feature, not a refactor.
