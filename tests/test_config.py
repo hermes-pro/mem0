@@ -55,6 +55,22 @@ class DefaultsTests(TempHomeTestCase):
     def test_telemetry_off_by_default(self):
         self.assertFalse(_config.load_config(self.home)["telemetry"])
 
+    def test_default_embedder_is_local_and_keyless(self):
+        # The whole plugin exists for people without an OpenAI key; a default
+        # embedder that needs one would block them at step one.
+        config = _config.load_config(self.home)
+        embedder = config["embedder"]
+        self.assertEqual(embedder["provider"], "fastembed")
+        self.assertEqual(embedder["config"]["model"], _config.DEFAULT_FASTEMBED_MODEL)
+        self.assertEqual(
+            embedder["config"]["embedding_dims"],
+            _config.KNOWN_DIMS[_config.DEFAULT_FASTEMBED_MODEL],
+        )
+        self.assertEqual(_config.embedder_key_missing(config), "")
+
+    def test_fastembed_is_first_in_the_picker(self):
+        self.assertEqual(_config.EMBEDDER_CHOICES[0], "fastembed")
+
 
 class OverrideTests(TempHomeTestCase):
     def test_file_overrides_defaults_and_preserves_siblings(self):
@@ -180,6 +196,192 @@ class WizardTests(TempHomeTestCase):
     def test_schema_covers_wizard_keys(self):
         keys = {field["key"] for field in _config.config_schema(_config.default_config(self.home))}
         self.assertTrue({"user_id", "llm_model", "embedder_provider"} <= keys)
+
+
+class EmbedderDependencyTests(TempHomeTestCase):
+    """Per-embedder pip requirements and the install-on-selection hook."""
+
+    def setUp(self):
+        super().setUp()
+        self._installed = []
+        self._result = type("R", (), {"ok": True, "reason": "", "stderr": ""})()
+
+    def _fake_installer(self, specs, **kwargs):
+        self._installed.append(list(specs))
+        return self._result
+
+    def _patch_installer(self):
+        """Route ensure_embedder_dependencies at a recorder, not real pip."""
+        import sys
+        import types
+
+        module = sys.modules.get("tools.lazy_deps")
+        created = module is None
+        if created:
+            tools = sys.modules.get("tools")
+            if tools is None:
+                tools = types.ModuleType("tools")
+                tools.__path__ = []
+                sys.modules["tools"] = tools
+            module = types.ModuleType("tools.lazy_deps")
+            sys.modules["tools.lazy_deps"] = module
+        previous = getattr(module, "install_specs", None)
+        module.install_specs = self._fake_installer
+        # The suite sets MEM0_HERMES_NO_INSTALL to stop real installs; lift it
+        # only while the installer is a recorder.
+        saved_guard = os.environ.pop(_config.NO_INSTALL_ENV, None)
+
+        def restore():
+            if created:
+                sys.modules.pop("tools.lazy_deps", None)
+            elif previous is not None:
+                module.install_specs = previous
+            else:
+                delattr(module, "install_specs")
+            if saved_guard is not None:
+                os.environ[_config.NO_INSTALL_ENV] = saved_guard
+
+        self.addCleanup(restore)
+
+    def test_requirements_listed_only_for_the_selected_provider(self):
+        for provider, expected in (
+            ("fastembed", "fastembed"),
+            ("ollama", "ollama"),
+            ("huggingface", "sentence-transformers"),
+            ("openai", None),
+            ("gemini", None),
+        ):
+            config = {"embedder": {"provider": provider, "config": {}}}
+            specs = _config.embedder_pip_requirements(config)
+            if expected is None:
+                self.assertEqual(specs, (), provider)
+            else:
+                # Already-importable packages drop out, so assert on membership.
+                self.assertTrue(
+                    all(spec.startswith(expected) for spec in specs), (provider, specs)
+                )
+
+    def test_importable_packages_are_not_reinstalled(self):
+        config = {"embedder": {"provider": "fastembed", "config": {}}}
+        if not _config._importable("fastembed"):
+            self.skipTest("fastembed is not installed in this interpreter")
+        self.assertEqual(_config.embedder_pip_requirements(config), ())
+        self.assertEqual(_config.ensure_embedder_dependencies(config), (True, ""))
+
+    def test_install_guard_blocks_runtime_installs(self):
+        os.environ[_config.NO_INSTALL_ENV] = "1"
+        config = {"embedder": {"provider": "ollama", "config": {}}}
+        if not _config.embedder_pip_requirements(config):
+            self.skipTest("the ollama package is already installed")
+        ok, message = _config.ensure_embedder_dependencies(config)
+        self.assertFalse(ok)
+        self.assertIn(_config.NO_INSTALL_ENV, message)
+
+    def test_ensure_installs_missing_specs(self):
+        self._patch_installer()
+        config = {"embedder": {"provider": "ollama", "config": {}}}
+        missing = _config.embedder_pip_requirements(config)
+        if not missing:
+            self.skipTest("the ollama package is already installed")
+        ok, message = _config.ensure_embedder_dependencies(config)
+        self.assertTrue(ok, message)
+        self.assertEqual(self._installed, [list(missing)])
+
+    def test_ensure_reports_a_blocked_install(self):
+        self._patch_installer()
+        self._result = type("R", (), {"ok": False, "reason": "installs disabled", "stderr": ""})()
+        config = {"embedder": {"provider": "ollama", "config": {}}}
+        if not _config.embedder_pip_requirements(config):
+            self.skipTest("the ollama package is already installed")
+        ok, message = _config.ensure_embedder_dependencies(config)
+        self.assertFalse(ok)
+        self.assertIn("installs disabled", message)
+
+    def test_save_config_installs_for_the_selected_embedder(self):
+        self._patch_installer()
+        logged = []
+        self.write_config({"embedder": {"provider": "ollama", "config": {}}})
+        missing = _config.embedder_pip_requirements(_config.load_config(self.home))
+        if not missing:
+            self.skipTest("the ollama package is already installed")
+        _config.save_config({"agent_id": "x"}, self.home, log=logged.append)
+        self.assertEqual(self._installed, [list(missing)])
+        self.assertTrue(any("Installing ollama" in line for line in logged), logged)
+
+    def test_save_config_installs_nothing_for_hosted_embedders(self):
+        self._patch_installer()
+        self.write_config({"embedder": {"provider": "openai", "config": {}}})
+        _config.save_config({"agent_id": "x"}, self.home, log=lambda _m: None)
+        self.assertEqual(self._installed, [])
+
+    def test_save_config_writes_the_choice_before_installing(self):
+        """A failed install must not lose the user's selection."""
+        self._patch_installer()
+        self._result = type("R", (), {"ok": False, "reason": "no network", "stderr": ""})()
+        _config.save_config(
+            {"embedder_provider": "ollama", "embedder_model": "nomic-embed-text"},
+            self.home,
+            log=lambda _m: None,
+        )
+        saved = json.loads(
+            (self.home / _config.CONFIG_FILENAME).read_text(encoding="utf-8")
+        )
+        self.assertEqual(saved["embedder"]["provider"], "ollama")
+
+    def test_install_can_be_skipped_entirely(self):
+        self._patch_installer()
+        self.write_config({"embedder": {"provider": "ollama", "config": {}}})
+        _config.save_config({"agent_id": "x"}, self.home, install=False)
+        self.assertEqual(self._installed, [])
+
+
+class FastembedDimensionTests(TempHomeTestCase):
+    """Vector widths come from fastembed's registry, not from our table."""
+
+    def setUp(self):
+        super().setUp()
+        if not _config._importable("fastembed"):
+            self.skipTest("fastembed is not installed in this interpreter")
+
+    def test_known_dims_match_the_real_registry(self):
+        for model, dims in _config.KNOWN_DIMS.items():
+            actual = _config.resolve_fastembed_dims(model)
+            if actual is None:
+                continue  # not a fastembed model (OpenAI/Ollama entry)
+            self.assertEqual(actual, dims, model)
+
+    def test_default_model_width_is_authoritative(self):
+        self.assertEqual(
+            _config.resolve_fastembed_dims(_config.DEFAULT_FASTEMBED_MODEL),
+            _config.KNOWN_DIMS[_config.DEFAULT_FASTEMBED_MODEL],
+        )
+
+    def test_sync_is_a_noop_when_dims_already_correct(self):
+        config = _config.load_config(self.home)
+        self.assertEqual(_config.sync_fastembed_dims(config), (False, ""))
+
+    def test_sync_corrects_a_wrong_width(self):
+        config = _config.load_config(self.home)
+        config["embedder"]["config"]["embedding_dims"] = 1536
+        changed, note = _config.sync_fastembed_dims(config)
+        self.assertTrue(changed)
+        self.assertIn("1536", note)
+        self.assertEqual(
+            config["embedder"]["config"]["embedding_dims"],
+            _config.KNOWN_DIMS[_config.DEFAULT_FASTEMBED_MODEL],
+        )
+
+    def test_sync_reports_an_unsupported_model(self):
+        config = _config.load_config(self.home)
+        config["embedder"]["config"]["model"] = "not/a-real-model"
+        changed, note = _config.sync_fastembed_dims(config)
+        self.assertFalse(changed)
+        self.assertIn("does not offer model", note)
+        self.assertIn("Supported models include", note)
+
+    def test_sync_ignores_other_providers(self):
+        config = {"embedder": {"provider": "openai", "config": {"model": "x"}}}
+        self.assertEqual(_config.sync_fastembed_dims(config), (False, ""))
 
 
 class EmbedderCredentialTests(TempHomeTestCase):

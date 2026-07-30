@@ -47,7 +47,18 @@ class MemoryConfigTranslationTests(unittest.TestCase):
     def test_embedding_dims_propagate_to_vector_store(self):
         config = _config.load_config(self.home)
         built = _backend.build_memory_config(config)
-        self.assertEqual(built["vector_store"]["config"]["embedding_model_dims"], 1536)
+        self.assertEqual(
+            built["vector_store"]["config"]["embedding_model_dims"],
+            _config.KNOWN_DIMS[_config.DEFAULT_FASTEMBED_MODEL],
+        )
+
+    def test_default_embedder_is_local_fastembed(self):
+        config = _config.load_config(self.home)
+        built = _backend.build_memory_config(config)
+        self.assertEqual(built["embedder"]["provider"], "fastembed")
+        self.assertEqual(
+            built["embedder"]["config"]["model"], _config.DEFAULT_FASTEMBED_MODEL
+        )
 
     def test_paths_are_expanded_and_parents_created(self):
         config = _config.load_config(self.home)
@@ -97,6 +108,50 @@ class MemoryConfigTranslationTests(unittest.TestCase):
             if saved is not None:
                 os.environ["MEM0_TELEMETRY"] = saved
 
+    def test_fastembed_cache_is_durable_and_outside_hermes_home(self):
+        cache = _backend._fastembed_cache_dir()
+        self.assertEqual(cache.name, "fastembed")
+        # Temp dirs get swept; a swept cache means a silent re-download.
+        self.assertNotIn("temp", str(cache).lower())
+        home = _config.hermes_home().resolve()
+        self.assertFalse(
+            home == cache or home in cache.parents,
+            f"{cache} is inside HERMES_HOME and would bloat `hermes backup`",
+        )
+
+    def test_cache_path_set_only_for_fastembed(self):
+        saved = os.environ.pop("FASTEMBED_CACHE_PATH", None)
+        try:
+            _backend._prepare_environment(
+                {"embedder": {"provider": "openai", "config": {}}}
+            )
+            self.assertIsNone(os.environ.get("FASTEMBED_CACHE_PATH"))
+            _backend._prepare_environment(
+                {"embedder": {"provider": "fastembed", "config": {}}}
+            )
+            self.assertEqual(
+                os.environ.get("FASTEMBED_CACHE_PATH"),
+                str(_backend._fastembed_cache_dir()),
+            )
+        finally:
+            os.environ.pop("FASTEMBED_CACHE_PATH", None)
+            if saved is not None:
+                os.environ["FASTEMBED_CACHE_PATH"] = saved
+
+    def test_existing_cache_path_is_respected(self):
+        saved = os.environ.get("FASTEMBED_CACHE_PATH")
+        os.environ["FASTEMBED_CACHE_PATH"] = "/operators/choice"
+        try:
+            _backend._prepare_environment(
+                {"embedder": {"provider": "fastembed", "config": {}}}
+            )
+            self.assertEqual(os.environ["FASTEMBED_CACHE_PATH"], "/operators/choice")
+        finally:
+            if saved is None:
+                os.environ.pop("FASTEMBED_CACHE_PATH", None)
+            else:
+                os.environ["FASTEMBED_CACHE_PATH"] = saved
+
 
 class FakeEmbedder:
     """Deterministic stand-in so no embedding API is contacted."""
@@ -130,9 +185,18 @@ class Mem0IntegrationTests(unittest.TestCase):
         self.home = Path(self._tmp.name)
         self.addCleanup(self._tmp.cleanup)
         self.config = _config.load_config(self.home)
-        # A placeholder key keeps Mem0's OpenAI *embedder* constructible; it is
-        # replaced with FakeEmbedder before any call is made.
-        self.config["embedder"]["config"]["api_key"] = "test-key-not-used"
+        # Deliberately NOT the fastembed default: building it would pip-install
+        # fastembed and download ONNX weights into whatever interpreter is
+        # running the suite. Mem0's OpenAI embedder needs only a placeholder key
+        # to construct, and FakeEmbedder replaces it before any call is made.
+        self.config["embedder"] = {
+            "provider": "openai",
+            "config": {
+                "model": "text-embedding-3-small",
+                "embedding_dims": 1536,
+                "api_key": "test-key-not-used",
+            },
+        }
         self.backend = None
 
     def tearDown(self):
@@ -143,7 +207,9 @@ class Mem0IntegrationTests(unittest.TestCase):
         fake = RecordingCallLlm(response=response)
         install_call_llm(fake)
         self.backend = _backend.HermesRoutedMem0Backend(self.config)
-        self.backend.memory.embedding_model = FakeEmbedder()
+        # Match the collection's width, or upserts fail on dimension mismatch.
+        dims = self.config["embedder"]["config"]["embedding_dims"]
+        self.backend.memory.embedding_model = FakeEmbedder(dims)
         return fake
 
     def test_memory_uses_the_routed_llm(self):
@@ -205,6 +271,64 @@ class Mem0IntegrationTests(unittest.TestCase):
         self.backend.delete(memory_id)
         remaining = self.backend.search("Hamburg", filters={"user_id": "tester"}, top_k=5)
         self.assertFalse(any(r.get("id") == memory_id for r in remaining))
+
+
+@unittest.skipUnless(
+    _have("mem0") and _have("qdrant_client") and _have("fastembed"),
+    "requires mem0ai + qdrant-client + fastembed",
+)
+class FastembedDefaultTests(unittest.TestCase):
+    """The shipped default, exercised for real: local embeddings, no API key.
+
+    Uses real fastembed embeddings against a real local Qdrant collection — only
+    the routed LLM is faked. Loads ONNX weights, so it is the slowest test here;
+    it skips when fastembed isn't installed rather than installing it.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.config = _config.load_config(self.home)
+        self.backend = None
+
+    def tearDown(self):
+        if self.backend is not None:
+            self.backend.close()
+
+    def test_default_config_stores_and_recalls_without_any_api_key(self):
+        saved = os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            self.assertEqual(_config.embedder_key_missing(self.config), "")
+            install_call_llm(RecordingCallLlm(response=FakeResponse('{"memory": []}')))
+            self.backend = _backend.HermesRoutedMem0Backend(self.config)
+            self.assertEqual(
+                type(self.backend.memory.embedding_model).__name__, "FastEmbedEmbedding"
+            )
+            self.backend.add(
+                [{"role": "user", "content": "Deploys on Fridays are forbidden"}],
+                user_id="tester",
+                agent_id="hermes",
+                infer=False,
+            )
+            results = self.backend.search(
+                "when can we deploy?", filters={"user_id": "tester"}, top_k=5
+            )
+        finally:
+            if saved is not None:
+                os.environ["OPENAI_API_KEY"] = saved
+        self.assertTrue(
+            any("Fridays" in (r.get("memory") or "") for r in results), results
+        )
+
+    def test_configured_width_matches_what_fastembed_produces(self):
+        # A mismatch here is what silently breaks every write.
+        install_call_llm(RecordingCallLlm(response=FakeResponse('{"memory": []}')))
+        self.backend = _backend.HermesRoutedMem0Backend(self.config)
+        vector = self.backend.memory.embedding_model.embed("probe", "add")
+        self.assertEqual(
+            len(vector), self.config["embedder"]["config"]["embedding_dims"]
+        )
 
 
 if __name__ == "__main__":

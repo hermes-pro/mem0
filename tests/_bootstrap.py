@@ -113,6 +113,10 @@ def _load_plugin_package() -> None:
 
 def bootstrap() -> None:
     global HERMES_AGENT_AVAILABLE
+    # Hard stop on runtime pip installs. Selecting an embedder normally installs
+    # its packages, and a test that reached that path would silently mutate
+    # whichever interpreter is running the suite (it did, once).
+    os.environ.setdefault("MEM0_HERMES_NO_INSTALL", "1")
     _prepend(HERMES_AGENT_DIR)
     HERMES_AGENT_AVAILABLE = _module_available("agent.memory_provider")
     if not HERMES_AGENT_AVAILABLE:

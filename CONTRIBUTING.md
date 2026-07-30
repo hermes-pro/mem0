@@ -82,9 +82,18 @@ A few constraints aren't obvious from reading a single file:
   installed directory name, and Hermes resolves `memory.provider` against
   bundled providers first — a directory named `mem0` would be shadowed by the
   bundled Mem0 plugin and never load.
-- **No new runtime dependencies.** `mem0ai` is the only one, declared in
-  `plugin.yaml` and installed by `hermes memory setup`. Anything else has to be
-  optional and lazily imported.
+- **No new unconditional runtime dependencies.** `mem0ai` is the only declared
+  one. Embedder packages (`fastembed`, `ollama`, `sentence-transformers`) are
+  installed per selection via `ensure_embedder_dependencies`, because
+  `hermes memory setup` installs `plugin.yaml` dependencies *before* the user
+  picks an embedder — declaring them there would download every embedder's stack
+  for everyone. Anything else must be optional and lazily imported.
+- **The test suite must never install anything.** `tests/_bootstrap.py` sets
+  `MEM0_HERMES_NO_INSTALL=1`, which makes `ensure_embedder_dependencies` refuse
+  to run pip. Tests that need to exercise the install path patch
+  `tools.lazy_deps.install_specs` and lift that guard for their duration — see
+  `EmbedderDependencyTests`. Never point a test at an embedder whose package
+  isn't already present.
 - **Don't route embeddings through `call_llm`.** Hermes has no embedding path;
   the `embedder` block is Mem0's to handle. If that changes upstream, that's a
   feature, not a refactor.

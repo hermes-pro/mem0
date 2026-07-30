@@ -30,12 +30,40 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _fastembed_cache_dir() -> Path:
+    """A durable cache location for fastembed's ONNX weights.
+
+    fastembed defaults to ``%TEMP%/fastembed_cache`` (or the platform temp dir),
+    where a Disk Cleanup run silently deletes the weights and the next session
+    re-downloads them — or fails, if the box is offline by then. This keeps them
+    in the user's cache directory instead: durable, shared across Hermes
+    profiles, and deliberately NOT under HERMES_HOME, which ``hermes backup``
+    walks (nobody wants 65 MB of model weights in every backup).
+    """
+    if os.name == "nt":
+        root = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(root) / "fastembed"
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".cache") / "fastembed"
+
+
 def _prepare_environment(config: Dict[str, Any]) -> None:
-    """Set Mem0 env knobs that are only read at import time."""
+    """Set Mem0/fastembed env knobs that are only read at import time."""
     if not config.get("telemetry", False):
         # Read once in mem0.memory.telemetry at import; must be set before the
         # first `import mem0`. setdefault so an explicit user value wins.
         os.environ.setdefault("MEM0_TELEMETRY", "false")
+
+    if (config.get("embedder") or {}).get("provider") == "fastembed":
+        # Mem0 passes only ``model_name`` to fastembed, so the cache location has
+        # to come from the environment. setdefault: an operator who already set
+        # FASTEMBED_CACHE_PATH keeps their choice.
+        cache = _fastembed_cache_dir()
+        try:
+            cache.mkdir(parents=True, exist_ok=True)
+            os.environ.setdefault("FASTEMBED_CACHE_PATH", str(cache))
+        except OSError as exc:
+            logger.debug("mem0_hermes: leaving fastembed's default cache: %s", exc)
 
 
 def _ensure_mem0_installed() -> None:
@@ -53,6 +81,53 @@ def _ensure_mem0_installed() -> None:
         ensure("memory.mem0", prompt=False)
     except Exception as exc:  # pragma: no cover - environment dependent
         logger.debug("mem0_hermes: lazy install of mem0ai unavailable: %s", exc)
+
+
+def _ensure_embedder_installed(config: Dict[str, Any]) -> None:
+    """Install the selected embedder's packages if they went missing.
+
+    ``hermes memory setup`` already installs them at selection time, so this is
+    the repair path: a rebuilt venv (``hermes update``) drops them, and
+    ``hermes plugins update`` only refreshes what ``plugin.yaml`` declares. Left
+    alone, the next session would fail on ``import fastembed`` with no hint that
+    a reinstall fixes it.
+    """
+    from . import _config as cfgmod
+
+    if not cfgmod.embedder_pip_requirements(config):
+        return
+    provider = cfgmod.embedder_provider(config)
+    logger.warning(
+        "mem0_hermes: embedder '%s' is selected but its packages are missing; "
+        "installing (first run may take a minute)", provider,
+    )
+    ok, message = cfgmod.ensure_embedder_dependencies(config)
+    if not ok:
+        # Raised, not swallowed: Memory() would otherwise fail deeper in Mem0
+        # with an ImportError that doesn't mention how to fix it.
+        raise RuntimeError(message)
+    if message:
+        logger.info("mem0_hermes: %s", message)
+
+
+def _reconcile_embedding_dims(config: Dict[str, Any]) -> None:
+    """Trust fastembed's registry over our table for the vector width.
+
+    A wrong ``embedding_dims`` doesn't fail loudly — it creates a vector
+    collection at the wrong width, and every write then fails on a dimension
+    mismatch. Once fastembed is importable, its own model registry settles it.
+    Mutates ``config`` in place so the corrected width reaches both the vector
+    store config and ``_reset_collection_if_dims_changed``.
+    """
+    from . import _config as cfgmod
+
+    changed, note = cfgmod.sync_fastembed_dims(config)
+    if not note:
+        return
+    if changed:
+        logger.info("mem0_hermes: %s", note)
+    else:
+        logger.warning("mem0_hermes: %s", note)
 
 
 def _expand(value: Any) -> Any:
@@ -153,6 +228,9 @@ def build_memory(config: Dict[str, Any]):
     """
     _prepare_environment(config)
     _ensure_mem0_installed()
+    _ensure_embedder_installed(config)
+    # After the install, so fastembed's registry is available to check against.
+    _reconcile_embedding_dims(config)
 
     from ._hermes_llm import HermesRoutedLLM, RoutedLlmConfig, register_with_mem0
 
