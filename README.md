@@ -21,7 +21,7 @@ Start a new session to activate. Accepting the defaults gets you working memory
 with **no credentials of any kind** — extraction borrows your Hermes provider's
 auth, embeddings run locally.
 
-## Updating and removing:
+## Updating and uninstalling:
 
 ```bash
 hermes plugins update mem0_hermes        # git pull in place
