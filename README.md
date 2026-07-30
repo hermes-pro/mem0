@@ -164,7 +164,8 @@ checkout directory name doesn't matter; the destination is always
     "lock_retries": 5,
     "lock_retry_backoff": 0.25,
     "sqlite_wal": true,            // defer to Hermes's WAL policy for history.db
-    "sqlite_busy_timeout_ms": 15000
+    "sqlite_busy_timeout_ms": 15000,
+    "background_init": true        // build the backend off the startup path
   },
   "history_db_path": "<HERMES_HOME>/mem0_hermes/history.db",
   "custom_instructions": null      // extra guidance for fact extraction
@@ -209,6 +210,35 @@ Responses API request, rebuilding the payload and forwarding only `timeout`,
 `extra_body.reasoning` and `tools` — a `response_format` is silently dropped
 rather than honored, so `prompt` mode is what actually keeps extraction parseable
 there. Same reasoning for Anthropic and Bedrock.
+
+## What blocks, and for how long
+
+Hermes calls `initialize()` inline on the session-startup path and dispatches
+memory tool calls inline on the agent loop, so both are worth knowing the cost
+of. Measured on this machine with the fastembed default:
+
+| Path | Cost | Notes |
+| --- | --- | --- |
+| `initialize()` | **2 ms** | The backend builds on a background thread. Building it inline costs ~1 511 ms, almost all of it loading the embedder's ONNX weights |
+| `system_prompt_block()` | 0 ms | Never touches the backend |
+| First turn's `prefetch()` | up to the build (~1.5 s), capped at 3 s | Waits for the backend so the first turn still gets recall |
+| Later `prefetch()` | ~22 ms, off the hot path | Started at `on_turn_start`, consumed when the turn needs it |
+| `mem0_add` / `mem0_search` tool call | ~15–25 ms | Runs inline on the agent loop |
+| `sync_turn` (extraction) | 0 ms on the loop | Background thread; the LLM call happens there |
+
+The build isn't free, it's just moved somewhere it overlaps with the user typing
+their first message. Worst case — a message submitted the instant the session
+starts — it's paid once at the first prefetch, bounded by that 3 s cap, and
+`mem0_search` remains available afterwards as the backstop.
+
+`mem0_add` stays synchronous deliberately. At ~20 ms it's noise next to a model
+round-trip, and making it fire-and-forget would mean a `mem0_search` immediately
+after couldn't see what was just stored. `concurrency.background_init: false`
+restores the old inline build if you'd rather pay it at startup.
+
+One case can exceed these numbers: if another process holds the embedded Qdrant
+store, a tool call waits out the lease retry (up to ~6 s by default) before
+reporting. See below.
 
 ## Multiple Hermes processes
 

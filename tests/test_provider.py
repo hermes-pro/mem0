@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -329,6 +330,104 @@ class TurnLifecycleTests(ProviderTestCase):
     def test_shutdown_closes_the_backend(self):
         provider, backend = self.make_provider()
         provider.shutdown()
+        self.assertTrue(backend.closed)
+
+
+BUILD_SECONDS = 0.6
+
+
+class BackgroundInitTests(ProviderTestCase):
+    """initialize() runs on Hermes's session-startup path and must not stall it.
+
+    Building the backend loads the embedder — ~1.5 s for fastembed's ONNX
+    weights — so doing it inline delays every session start by that much.
+    """
+
+    def _slow_provider(self, backend=None, **init_kwargs):
+        backend = backend if backend is not None else FakeBackend()
+
+        def slow_build(config):
+            # The delay has to be inside the factory: a pre-built double would
+            # make the build instant and every assertion here vacuous.
+            time.sleep(BUILD_SECONDS)
+            return backend
+
+        _backend.HermesRoutedMem0Backend = slow_build
+        provider = Mem0HermesMemoryProvider()
+        self.addCleanup(provider.shutdown)
+        started = time.monotonic()
+        provider.initialize("session-1", hermes_home=str(self.home), **init_kwargs)
+        return provider, backend, time.monotonic() - started
+
+    def test_initialize_returns_before_the_backend_is_built(self):
+        provider, _backend_obj, elapsed = self._slow_provider()
+        self.assertLess(
+            elapsed, BUILD_SECONDS / 2,
+            f"initialize() blocked for {elapsed:.2f}s on the backend build",
+        )
+        self.assertFalse(provider._backend_ready.is_set())
+
+    def test_the_backend_arrives_shortly_after(self):
+        provider, backend, _elapsed = self._slow_provider()
+        self.assertIsNotNone(provider._await_backend(10))
+        self.assertIs(provider._backend, backend)
+
+    def test_a_tool_call_waits_for_the_backend_instead_of_failing(self):
+        provider, _backend_obj, _elapsed = self._slow_provider()
+        payload = json.loads(provider.handle_tool_call("mem0_add", {"content": "x"}))
+        self.assertNotIn("error", payload)
+        self.assertEqual(payload["result"], "Fact stored.")
+
+    def test_a_tool_call_that_times_out_says_so(self):
+        provider, _backend_obj, _elapsed = self._slow_provider()
+        import mem0_hermes
+
+        original = mem0_hermes._BACKEND_WAIT_SECS
+        mem0_hermes._BACKEND_WAIT_SECS = 0.0
+        try:
+            payload = json.loads(provider.handle_tool_call("mem0_search", {"query": "x"}))
+        finally:
+            mem0_hermes._BACKEND_WAIT_SECS = original
+        self.assertIn("still starting up", payload["error"])
+
+    def test_first_turn_recall_still_works_while_building(self):
+        # The prefetch worker waits for the backend, so a turn that starts
+        # during the build isn't silently left without memory.
+        provider, _backend_obj, _elapsed = self._slow_provider(
+            FakeBackend(results=[{"memory": "likes tea"}])
+        )
+        provider.on_turn_start(1, "tea?")
+        self.assertIn("likes tea", provider.prefetch("tea?"))
+
+    def test_sync_turn_waits_for_the_backend(self):
+        provider, backend, _elapsed = self._slow_provider()
+        provider.sync_turn("I drink dark roast", "Noted.")
+        provider._sync_thread.join(timeout=10)
+        self.assertEqual(len(backend.adds), 1)
+
+    def test_system_prompt_never_blocks(self):
+        provider, _backend_obj, _elapsed = self._slow_provider()
+        started = time.monotonic()
+        block = provider.system_prompt_block()
+        self.assertLess(time.monotonic() - started, BUILD_SECONDS / 2)
+        self.assertIn("mem0_search", block)
+
+    def test_background_init_can_be_disabled(self):
+        (self.home / "mem0_hermes.json").write_text(
+            json.dumps({"concurrency": {"background_init": False}}), encoding="utf-8"
+        )
+        provider, _backend_obj, elapsed = self._slow_provider()
+        # Not an exact bound: time.sleep can return a few ms early (Windows
+        # timer granularity). The claim is "it blocked for the build", not a
+        # precise duration.
+        self.assertGreaterEqual(elapsed, BUILD_SECONDS * 0.8)
+        self.assertTrue(provider._backend_ready.is_set())
+
+    def test_shutdown_during_a_build_does_not_hang(self):
+        provider, backend, _elapsed = self._slow_provider()
+        started = time.monotonic()
+        provider.shutdown()
+        self.assertLess(time.monotonic() - started, 10)
         self.assertTrue(backend.closed)
 
 

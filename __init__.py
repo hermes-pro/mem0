@@ -20,7 +20,11 @@ Activate with ``memory.provider: mem0_hermes`` in ``config.yaml``, or by running
 
 Lifecycle behavior (prefetch-with-short-wait, background turn sync, and the
 consecutive-failure circuit breaker) follows the bundled ``plugins/memory/mem0``
-provider so the two behave identically from the agent's point of view.
+provider so the two behave identically from the agent's point of view. One
+addition: the backend is built on a background thread, because ``initialize()``
+runs inline on Hermes's session-startup path and loading a local embedder costs
+~1.5 s. Consumers wait for readiness where it matters instead — prefetch inside
+its existing budget, tool calls and turn sync in their own threads.
 """
 
 from __future__ import annotations
@@ -42,6 +46,10 @@ _BREAKER_COOLDOWN_SECS = 120
 # How long the hot path waits for an in-flight prefetch before giving up and
 # leaving mem0_search as the backstop.
 _PREFETCH_WAIT_SECS = 3
+# How long a tool call or a turn sync waits for the backend to finish building.
+# Generous because it only applies while the embedder loads (~1.5 s for
+# fastembed) and the alternative is telling the model memory is unavailable.
+_BACKEND_WAIT_SECS = 30
 
 _CLIENT_ERROR_TYPES = ("MemoryNotFoundError", "ValidationError", "ValueError")
 
@@ -147,6 +155,9 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         self._channel = "cli"
         self._agent_context = "primary"
         self._rerank_default = False
+        self._init_started = False
+        self._backend_ready = threading.Event()
+        self._backend_thread: Optional[threading.Thread] = None
         self._prefetch_thread: Optional[threading.Thread] = None
         self._prefetch_query = ""
         self._prefetch_result = ""
@@ -242,10 +253,54 @@ class Mem0HermesMemoryProvider(MemoryProvider):
             rerank.lower() in ("true", "1", "yes") if isinstance(rerank, str) else bool(rerank)
         )
 
-        self._backend = self._create_backend()
-        if self._backend is not None and not self._atexit_registered:
+        concurrency = self._config.get("concurrency")
+        concurrency = concurrency if isinstance(concurrency, dict) else {}
+        background = concurrency.get("background_init", True)
+        if isinstance(background, str):
+            background = background.strip().lower() not in ("false", "0", "no")
+
+        self._backend_ready.clear()
+        self._init_started = True
+        if background:
+            # Building the backend loads the embedder — measured at ~1.5 s for
+            # fastembed's ONNX weights — and Hermes calls initialize() inline on
+            # the session startup path (agent_init.py). Doing it here would stall
+            # every session start by that much. Consumers wait for readiness where
+            # it actually matters: prefetch inside its existing budget, tool calls
+            # and turn sync in their own threads.
+            self._backend_thread = threading.Thread(
+                target=self._build_backend, daemon=True, name="mem0-hermes-init",
+            )
+            self._backend_thread.start()
+        else:
+            self._build_backend()
+
+    def _build_backend(self) -> None:
+        """Construct the backend and publish it to whoever is waiting."""
+        backend = None
+        try:
+            backend = self._create_backend()
+        finally:
+            self._backend = backend
+            self._backend_ready.set()
+        if backend is not None and not self._atexit_registered:
             atexit.register(self._shutdown_backend)
             self._atexit_registered = True
+
+    def _await_backend(self, timeout: float):
+        """Return the backend once built, or ``None`` if it isn't ready in time.
+
+        Never raises: callers treat ``None`` as "memory unavailable right now",
+        which is the same path a failed build already takes.
+        """
+        if self._backend_ready.is_set():
+            return self._backend
+        if not self._init_started:
+            # Nothing is building, so waiting would burn the full timeout for a
+            # result that can never arrive.
+            return None
+        self._backend_ready.wait(timeout=max(0.0, timeout))
+        return self._backend
 
     def _create_backend(self):
         from . import _backend as backend_mod
@@ -288,9 +343,16 @@ class Mem0HermesMemoryProvider(MemoryProvider):
                 pass
 
     def shutdown(self) -> None:
+        # The builder first: closing a store that is still being constructed
+        # would race the construction, and the workers below may be waiting on it.
+        if self._backend_thread is not None and self._backend_thread.is_alive():
+            self._backend_thread.join(timeout=_BACKEND_WAIT_SECS)
         for thread in (self._prefetch_thread, self._sync_thread):
             if thread is not None and thread.is_alive():
                 thread.join(timeout=5.0)
+        # Unblocks anything still waiting: they see no backend and give up
+        # instead of sitting out their full timeout during shutdown.
+        self._backend_ready.set()
         self._shutdown_backend()
 
     # -- Circuit breaker ----------------------------------------------------
@@ -371,9 +433,12 @@ class Mem0HermesMemoryProvider(MemoryProvider):
             return result
 
     def _start_prefetch(self, query: str) -> None:
-        if not query or self._backend is None or self._is_breaker_open():
+        # Deliberately does not require the backend to exist yet: the worker
+        # waits for it, so a first turn that starts while the embedder is still
+        # loading still gets recall (within prefetch's budget) instead of
+        # silently returning nothing.
+        if not query or self._is_breaker_open():
             return
-        backend = self._backend
         with self._prefetch_lock:
             if self._prefetch_query == query:
                 if self._prefetch_done:
@@ -387,6 +452,9 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         def _run() -> None:
             body = ""
             try:
+                backend = self._await_backend(_PREFETCH_WAIT_SECS)
+                if backend is None:
+                    return
                 results = backend.search(
                     query, filters=self._read_filters(), top_k=10, rerank=False
                 )
@@ -430,7 +498,7 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Hand the turn to Mem0 for extraction on the Hermes model (async)."""
-        if self._backend is None or self._is_breaker_open():
+        if self._is_breaker_open():
             return
         if not (user_content or assistant_content):
             return
@@ -440,10 +508,13 @@ class Mem0HermesMemoryProvider(MemoryProvider):
                 self._agent_context, self._channel,
             )
             return
-
-        backend = self._backend
+        if self._backend is None and self._backend_ready.is_set():
+            return  # the build finished and failed; nothing to write to
 
         def _sync() -> None:
+            backend = self._await_backend(_BACKEND_WAIT_SECS)
+            if backend is None:
+                return
             try:
                 backend.add(
                     [
@@ -478,7 +549,17 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         return [SEARCH_SCHEMA, ADD_SCHEMA, UPDATE_SCHEMA, DELETE_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
-        if self._backend is None:
+        # Tool calls run inline on the agent loop (tool_executor.py), so this is
+        # the one place a wait is visible to the user. It only bites on a call
+        # that lands while the embedder is still loading; afterwards the backend
+        # is already published and this returns immediately.
+        backend = self._await_backend(_BACKEND_WAIT_SECS)
+        if backend is None:
+            if self._init_started and not self._backend_ready.is_set():
+                return _tool_error(
+                    "Memory is still starting up (loading the embedding model). "
+                    "Try again in a moment."
+                )
             return _tool_error(
                 "mem0_hermes backend not initialized: "
                 f"{self._init_error or 'unknown error'}"
@@ -498,7 +579,7 @@ class Mem0HermesMemoryProvider(MemoryProvider):
             except (TypeError, ValueError):
                 top_k = 10
             try:
-                results = self._backend.search(
+                results = backend.search(
                     query,
                     filters=self._read_filters(),
                     top_k=top_k,
@@ -526,7 +607,7 @@ class Mem0HermesMemoryProvider(MemoryProvider):
             if not content:
                 return _tool_error("Missing required parameter: content")
             try:
-                self._backend.add(
+                backend.add(
                     [{"role": "user", "content": content}],
                     user_id=self._user_id,
                     agent_id=self._agent_id,
@@ -547,7 +628,7 @@ class Mem0HermesMemoryProvider(MemoryProvider):
             if not text:
                 return _tool_error("Missing required parameter: text")
             try:
-                result = self._backend.update(memory_id, text)
+                result = backend.update(memory_id, text)
                 self._record_success()
             except Exception as exc:
                 if _is_client_error(exc):
@@ -561,7 +642,7 @@ class Mem0HermesMemoryProvider(MemoryProvider):
             if not memory_id:
                 return _tool_error("Missing required parameter: memory_id")
             try:
-                result = self._backend.delete(memory_id)
+                result = backend.delete(memory_id)
                 self._record_success()
             except Exception as exc:
                 if _is_client_error(exc):
