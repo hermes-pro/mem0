@@ -1,0 +1,10 @@
+name: mem0_hermes
+version: 1.0.0
+kind: exclusive
+description: "Mem0 (OSS) memory — fact extraction runs as a Hermes auxiliary call (Codex/OAuth friendly, no OpenAI key)."
+author: Hermes Pro
+# Informational — the manifest loader ignores unknown keys.
+license: Apache-2.0 OR MIT
+homepage: https://github.com/hermes-pro/mem0
+pip_dependencies:
+  - mem0ai>=2.0.10,<3
