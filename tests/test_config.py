@@ -8,6 +8,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import _bootstrap  # noqa: F401 - sys.path bootstrap
 
@@ -70,6 +71,47 @@ class DefaultsTests(TempHomeTestCase):
 
     def test_fastembed_is_first_in_the_picker(self):
         self.assertEqual(_config.EMBEDDER_CHOICES[0], "fastembed")
+
+
+class PlatformDefaultHomeTests(unittest.TestCase):
+    """The fallback used when ``hermes_constants`` is not importable.
+
+    Must agree with ``hermes_constants._get_platform_default_hermes_home()``.
+    A POSIX-only fallback here sends the vector store to ``~/.hermes`` on
+    Windows while Hermes itself uses ``%LOCALAPPDATA%\\hermes`` — the plugin
+    then reads an empty collection and writes memories nothing else can see.
+    """
+
+    def test_windows_uses_local_appdata(self):
+        with mock.patch.object(_config.sys, "platform", "win32"):
+            with mock.patch.dict(
+                os.environ, {"LOCALAPPDATA": r"C:\Users\tester\AppData\Local"}
+            ):
+                self.assertEqual(
+                    _config._platform_default_home(),
+                    Path(r"C:\Users\tester\AppData\Local") / "hermes",
+                )
+
+    def test_windows_without_localappdata_falls_back_under_home(self):
+        with mock.patch.object(_config.sys, "platform", "win32"):
+            with mock.patch.dict(os.environ, {"LOCALAPPDATA": ""}):
+                with mock.patch.object(Path, "home", staticmethod(lambda: Path("/u"))):
+                    self.assertEqual(
+                        _config._platform_default_home(),
+                        Path("/u") / "AppData" / "Local" / "hermes",
+                    )
+
+    def test_posix_uses_dot_hermes(self):
+        with mock.patch.object(_config.sys, "platform", "linux"):
+            with mock.patch.object(Path, "home", staticmethod(lambda: Path("/home/t"))):
+                self.assertEqual(
+                    _config._platform_default_home(), Path("/home/t") / ".hermes"
+                )
+
+    def test_env_var_still_wins_over_platform_default(self):
+        with mock.patch.dict(os.environ, {"HERMES_HOME": r"D:\custom"}):
+            with mock.patch.dict("sys.modules", {"hermes_constants": None}):
+                self.assertEqual(_config.hermes_home(), Path(r"D:\custom"))
 
 
 class OverrideTests(TempHomeTestCase):

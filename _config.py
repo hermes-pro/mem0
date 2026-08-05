@@ -40,6 +40,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -137,6 +138,24 @@ VECTOR_CHOICES = ["qdrant", "pgvector", "chroma", "faiss"]
 JSON_MODE_CHOICES = ["prompt", "response_format", "off"]
 
 
+def _platform_default_home() -> Path:
+    """Platform-native Hermes home, for when ``hermes_constants`` is unavailable.
+
+    Mirrors ``hermes_constants._get_platform_default_hermes_home()``. Kept in
+    sync by hand because this plugin has to resolve a home in contexts where
+    Hermes itself is not importable (standalone venv, setup wizard running
+    outside the agent process). Getting this wrong is not a cosmetic bug: a
+    non-platform-aware fallback puts the vector store under ``~/.hermes`` on
+    Windows while the rest of Hermes uses ``%LOCALAPPDATA%\\hermes``, so the
+    plugin reads an empty collection and writes memories nobody else sees.
+    """
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+        return base / "hermes"
+    return Path.home() / ".hermes"
+
+
 def hermes_home() -> Path:
     """Return the active HERMES_HOME, without requiring the agent to be running."""
     try:
@@ -145,7 +164,7 @@ def hermes_home() -> Path:
         return Path(get_hermes_home())
     except Exception:
         env = os.environ.get("HERMES_HOME", "").strip()
-        return Path(env) if env else Path.home() / ".hermes"
+        return Path(env) if env else _platform_default_home()
 
 
 def default_config(home: Optional[Path] = None) -> Dict[str, Any]:
