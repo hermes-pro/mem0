@@ -187,7 +187,9 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         self._prefetch_thread: Optional[threading.Thread] = None
         self._prefetch_query = ""
         self._prefetch_result = ""
+        self._prefetch_count = 0
         self._prefetch_done = False
+        self._last_recall_count = 0
         self._prefetch_lock = threading.Lock()
         self._sync_thread: Optional[threading.Thread] = None
         self._sync_cond = threading.Condition()
@@ -496,12 +498,14 @@ class Mem0HermesMemoryProvider(MemoryProvider):
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._start_prefetch(message)
 
-    def _consume_prefetch_result(self, query: str) -> Optional[str]:
+    def _consume_prefetch_result(self, query: str) -> Optional[Tuple[str, int]]:
+        """The prefetched block and how many memories it holds, once only."""
         with self._prefetch_lock:
             if self._prefetch_query != query or not self._prefetch_done:
                 return None
-            result = self._prefetch_result
+            result = (self._prefetch_result, self._prefetch_count)
             self._prefetch_result = ""
+            self._prefetch_count = 0
             self._prefetch_done = False
             return result
 
@@ -520,10 +524,12 @@ class Mem0HermesMemoryProvider(MemoryProvider):
                     return
             self._prefetch_query = query
             self._prefetch_result = ""
+            self._prefetch_count = 0
             self._prefetch_done = False
 
         def _run() -> None:
             body = ""
+            count = 0
             try:
                 backend = self._await_backend(_PREFETCH_WAIT_SECS)
                 if backend is not None:
@@ -537,6 +543,7 @@ class Mem0HermesMemoryProvider(MemoryProvider):
                         body = "## Mem0 Memory\n" + "\n".join(
                             f"- {line}" for line in lines
                         )
+                        count = len(lines)
                     self._record_success()
             except Exception as exc:
                 self._record_failure()
@@ -551,6 +558,7 @@ class Mem0HermesMemoryProvider(MemoryProvider):
                 with self._prefetch_lock:
                     if self._prefetch_query == query:
                         self._prefetch_result = body
+                        self._prefetch_count = count
                         self._prefetch_done = True
 
         thread = threading.Thread(target=_run, daemon=True, name="mem0-hermes-prefetch")
@@ -560,15 +568,30 @@ class Mem0HermesMemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         cached = self._consume_prefetch_result(query)
-        if cached is not None:
-            return cached
-        self._start_prefetch(query)
-        with self._prefetch_lock:
-            thread = self._prefetch_thread if self._prefetch_query == query else None
-        if thread is not None:
-            thread.join(timeout=_PREFETCH_WAIT_SECS)
-        cached = self._consume_prefetch_result(query)
-        return cached if cached is not None else ""
+        if cached is None:
+            self._start_prefetch(query)
+            with self._prefetch_lock:
+                thread = self._prefetch_thread if self._prefetch_query == query else None
+            if thread is not None:
+                thread.join(timeout=_PREFETCH_WAIT_SECS)
+            cached = self._consume_prefetch_result(query)
+        body, count = cached if cached is not None else ("", 0)
+        # Set on every path, including the empty ones: recall_status() must
+        # describe THIS turn, and a count left over from an earlier turn would
+        # show the user an indicator for memories that were not injected.
+        self._last_recall_count = count
+        return body
+
+    def recall_status(self):
+        """What the last :meth:`prefetch` injected, for the agent's indicator."""
+        if not self._last_recall_count:
+            return None
+        try:
+            from agent.memory_provider import RecallStatus
+        except ImportError:
+            # Older Hermes without the indicator: nothing to report to.
+            return None
+        return RecallStatus(provider_label="Mem0", count=self._last_recall_count)
 
     # -- Write --------------------------------------------------------------
 

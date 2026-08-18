@@ -373,6 +373,42 @@ class TurnLifecycleTests(ProviderTestCase):
         self.assertIn("- likes tea", block)
         self.assertIn("- lives in Berlin", block)
 
+    def test_recall_status_counts_what_was_injected(self):
+        backend = FakeBackend(
+            results=[{"memory": "likes tea"}, {"memory": "lives in Berlin"}]
+        )
+        provider, _ = self.make_provider(backend)
+        provider.on_turn_start(1, "tea?")
+        provider.prefetch("tea?")
+        status = provider.recall_status()
+        self.assertIsNotNone(status)
+        self.assertEqual(status.count, 2)
+        self.assertEqual(status.provider_label, "Mem0")
+
+    def test_recall_status_is_none_when_nothing_was_recalled(self):
+        provider, _ = self.make_provider(FakeBackend(results=[]))
+        provider.on_turn_start(1, "tea?")
+        provider.prefetch("tea?")
+        self.assertIsNone(provider.recall_status())
+
+    def test_recall_status_never_reports_a_stale_count(self):
+        # The ABC is explicit that a stale count is a bug: the indicator would
+        # tell the user memories were injected on a turn where none were.
+        backend = FakeBackend(results=[{"memory": "likes tea"}])
+        provider, _ = self.make_provider(backend)
+        provider.on_turn_start(1, "tea?")
+        provider.prefetch("tea?")
+        self.assertEqual(provider.recall_status().count, 1)
+
+        backend.results = []
+        provider.on_turn_start(2, "unrelated?")
+        provider.prefetch("unrelated?")
+        self.assertIsNone(provider.recall_status())
+
+    def test_recall_status_is_none_before_any_prefetch(self):
+        provider, _ = self.make_provider()
+        self.assertIsNone(provider.recall_status())
+
     def test_prefetch_result_is_consumed_once(self):
         backend = FakeBackend(results=[{"memory": "likes tea"}])
         provider, _ = self.make_provider(backend)
