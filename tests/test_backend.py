@@ -159,6 +159,80 @@ class MemoryConfigTranslationTests(unittest.TestCase):
                 os.environ["FASTEMBED_CACHE_PATH"] = saved
 
 
+class UpdateSignatureTests(unittest.TestCase):
+    """Mem0 renamed update()'s content parameter mid-2.x.
+
+    mem0ai 2.0.10 -- the floor plugin.yaml declares -- has
+    ``update(memory_id, data=None, ...)``; 2.0.18 has
+    ``update(memory_id, text=None, ..., data=None)``. Hardcoding either name
+    breaks mem0_update on half the supported range with
+    "Memory.update() got an unexpected keyword argument", which is what
+    shipped. These doubles stand in for both, so the check runs without
+    mem0ai installed -- the integration tests skip there, which is exactly
+    why this went unnoticed.
+    """
+
+    class _OldMemory:
+        def __init__(self):
+            self.calls = []
+
+        def update(self, memory_id, data=None, metadata=None):
+            self.calls.append({"memory_id": memory_id, "data": data})
+
+    class _NewMemory:
+        def __init__(self):
+            self.calls = []
+
+        def update(self, memory_id, text=None, metadata=None, data=None):
+            self.calls.append({"memory_id": memory_id, "text": text, "data": data})
+
+    class _PositionalOnlyMemory:
+        """Pre-2.x shape: the content has no default and no alias."""
+
+        def __init__(self):
+            self.calls = []
+
+        def update(self, memory_id, data):
+            self.calls.append({"memory_id": memory_id, "data": data})
+
+    def _backend(self, memory):
+        return _backend.HermesRoutedMem0Backend({}, memory=memory)
+
+    def test_older_mem0_receives_the_content_as_data(self):
+        memory = self._OldMemory()
+        result = self._backend(memory).update("abc", "corrected fact")
+        self.assertEqual(memory.calls, [{"memory_id": "abc", "data": "corrected fact"}])
+        self.assertEqual(result["memory_id"], "abc")
+
+    def test_newer_mem0_receives_the_content_as_text(self):
+        memory = self._NewMemory()
+        self._backend(memory).update("abc", "corrected fact")
+        self.assertEqual(
+            memory.calls,
+            [{"memory_id": "abc", "text": "corrected fact", "data": None}],
+        )
+
+    def test_content_is_never_dropped_on_a_required_parameter(self):
+        memory = self._PositionalOnlyMemory()
+        self._backend(memory).update("abc", "corrected fact")
+        self.assertEqual(memory.calls[0]["data"], "corrected fact")
+
+    def test_the_resolved_name_is_cached(self):
+        memory = self._NewMemory()
+        backend = self._backend(memory)
+        self.assertEqual(backend._update_content_kwarg(), "text")
+        self.assertEqual(backend._update_kwarg, "text")
+        self.assertEqual(backend._update_content_kwarg(), "text")
+
+    def test_an_unintrospectable_update_falls_back_to_data(self):
+        class Weird:
+            # signature() raises for some builtins/C wrappers.
+            update = print
+
+        backend = self._backend(Weird())
+        self.assertEqual(backend._update_content_kwarg(), "data")
+
+
 class GetAllWindowTests(unittest.TestCase):
     """Paging is sliced client-side, because Mem0 exposes no cursor."""
 

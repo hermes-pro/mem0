@@ -751,6 +751,7 @@ class HermesRoutedMem0Backend:
         self._config = config
         self._memory = memory if memory is not None else build_memory(config)
         self._lease = getattr(self._memory, "_hermes_lease", None)
+        self._update_kwarg = ""
         # Shared-owner bookkeeping (see _acquire_shared).
         self._share_key = ""
         self._refcount = 0
@@ -838,9 +839,39 @@ class HermesRoutedMem0Backend:
         with self._store():
             return self._memory.add(messages, **kwargs)
 
+    def _update_content_kwarg(self) -> str:
+        """Name of ``Memory.update``'s content parameter in the installed Mem0.
+
+        It was renamed mid-2.x. mem0ai 2.0.10 -- the floor this plugin declares
+        -- takes ``update(memory_id, data=None, ...)`` with no ``text`` at all;
+        2.0.18 takes ``update(memory_id, text=None, ..., data=None)``. Passing
+        the wrong one raises TypeError before the store is ever touched, so
+        mem0_update fails for every user on the older half of the supported
+        range.
+
+        Resolved from the signature rather than by trying one and catching
+        TypeError, which would also swallow a TypeError raised *inside* update.
+        Cached: the answer cannot change while the process runs.
+        """
+        if self._update_kwarg:
+            return self._update_kwarg
+        name = "data"
+        try:
+            import inspect
+
+            params = inspect.signature(self._memory.update).parameters
+            if "text" in params:
+                name = "text"
+        except (TypeError, ValueError):
+            # Unintrospectable (C extension, exotic wrapper). "data" is the
+            # name present in every released version; "text" is the newcomer.
+            pass
+        self._update_kwarg = name
+        return name
+
     def update(self, memory_id: str, text: str) -> dict:
         with self._store():
-            self._memory.update(memory_id, text=text)
+            self._memory.update(memory_id, **{self._update_content_kwarg(): text})
         return {"result": "Memory updated.", "memory_id": memory_id}
 
     def delete(self, memory_id: str) -> dict:
