@@ -36,6 +36,7 @@ class FakeBackend:
         self.updates = []
         self.deletes = []
         self.searches = []
+        self.listings = []
         self.closed = False
 
     def _maybe_raise(self):
@@ -59,6 +60,12 @@ class FakeBackend:
             }
         )
         return {}
+
+    def get_all(self, *, filters, limit=20, offset=0):
+        self.listings.append((filters, limit, offset))
+        self._maybe_raise()
+        window = self.results[offset : offset + limit]
+        return window, len(self.results) > offset + limit
 
     def update(self, memory_id, text):
         self._maybe_raise()
@@ -256,6 +263,69 @@ class ToolTests(ProviderTestCase):
         self.assertEqual(payload["count"], 1)
         self.assertEqual(payload["results"][0]["memory"], "likes tea")
         self.assertEqual(backend.searches[0][1], {"user_id": "tester"})
+
+    def test_get_all_lists_memories_with_ids(self):
+        backend = FakeBackend(
+            results=[
+                {"id": "1", "memory": "likes tea"},
+                {"id": "2", "memory": "lives in Berlin"},
+            ]
+        )
+        provider, _ = self.make_provider(backend)
+        payload = json.loads(provider.handle_tool_call("mem0_get_all", {}))
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["offset"], 0)
+        self.assertFalse(payload["has_more"])
+        self.assertEqual(payload["results"][0]["id"], "1")
+        self.assertEqual(backend.listings[0][0], {"user_id": "tester"})
+
+    def test_get_all_pages_and_reports_more(self):
+        backend = FakeBackend(
+            results=[{"id": str(n), "memory": f"fact {n}"} for n in range(5)]
+        )
+        provider, _ = self.make_provider(backend)
+        first = json.loads(
+            provider.handle_tool_call("mem0_get_all", {"limit": 2})
+        )
+        self.assertTrue(first["has_more"])
+        self.assertEqual([r["id"] for r in first["results"]], ["0", "1"])
+
+        second = json.loads(
+            provider.handle_tool_call("mem0_get_all", {"limit": 2, "offset": 2})
+        )
+        self.assertTrue(second["has_more"])
+        self.assertEqual([r["id"] for r in second["results"]], ["2", "3"])
+
+        last = json.loads(
+            provider.handle_tool_call("mem0_get_all", {"limit": 2, "offset": 4})
+        )
+        self.assertFalse(last["has_more"])
+        self.assertEqual([r["id"] for r in last["results"]], ["4"])
+
+    def test_get_all_clamps_limit_and_offset(self):
+        provider, backend = self.make_provider()
+        provider.handle_tool_call("mem0_get_all", {"limit": 900, "offset": -5})
+        self.assertEqual(backend.listings[0][1], 100)
+        self.assertEqual(backend.listings[0][2], 0)
+
+    def test_get_all_on_an_empty_store(self):
+        provider, _ = self.make_provider(FakeBackend(results=[]))
+        payload = json.loads(provider.handle_tool_call("mem0_get_all", {}))
+        self.assertIn("No memories stored yet", payload["result"])
+
+    def test_get_all_past_the_end_says_so(self):
+        backend = FakeBackend(results=[{"id": "1", "memory": "likes tea"}])
+        provider, _ = self.make_provider(backend)
+        payload = json.loads(
+            provider.handle_tool_call("mem0_get_all", {"offset": 50})
+        )
+        self.assertIn("past that offset", payload["result"])
+
+    def test_get_all_is_exposed_as_a_tool(self):
+        provider, _ = self.make_provider()
+        names = {schema["name"] for schema in provider.get_tool_schemas()}
+        self.assertIn("mem0_get_all", names)
+        self.assertIn("mem0_get_all", provider.system_prompt_block())
 
     def test_search_top_k_is_clamped(self):
         provider, backend = self.make_provider()

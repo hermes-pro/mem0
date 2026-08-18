@@ -372,10 +372,19 @@ too:
 3. Ask the agent to recall something from a previous session; `mem0_search`
    should return it.
 
-Tools exposed to the model (same names as the bundled plugin, so prompting and
-habits carry over): `mem0_search`, `mem0_add`, `mem0_update`, `mem0_delete`.
-`mem0_add` stores verbatim (`infer=False`) and spends no LLM call; turn-level
-extraction is what runs on your model, in a background thread after each turn.
+Tools exposed to the model (the bundled plugin's four names are unchanged, so
+prompting and habits carry over): `mem0_search`, `mem0_get_all`, `mem0_add`,
+`mem0_update`, `mem0_delete`. `mem0_add` stores verbatim (`infer=False`) and
+spends no LLM call; turn-level extraction is what runs on your model, in a
+background worker after each turn.
+
+`mem0_get_all` lists memories without a query — what you want when the user asks
+"what do you know about me?" or wants to prune. It takes `limit` (default 20,
+max 100) and `offset`, and reports `has_more`. Paging is sliced client-side:
+Mem0's `get_all` accepts only `top_k` and its Qdrant store discards the
+`next_page_offset` that `scroll` returns, so each page over-fetches `offset`
+extra rows and a write landing between two pages can shift the window. Fine for
+reviewing a store; don't build a paginated UI on it.
 
 ## Migrating from the bundled `mem0` plugin
 

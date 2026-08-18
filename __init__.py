@@ -135,6 +135,34 @@ ADD_SCHEMA = {
     },
 }
 
+GET_ALL_SCHEMA = {
+    "name": "mem0_get_all",
+    "description": (
+        "List stored memories in bulk, without a search query. Use when the "
+        "user asks what you remember about them, or wants to review, audit or "
+        "clean up their memories — mem0_search only surfaces what matches a "
+        "query, so it is the wrong tool for 'show me everything'. Returns a "
+        "page of memories with their IDs, usable with mem0_update and "
+        "mem0_delete. Order is the store's own and is not chronological."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {
+                "type": "integer",
+                "description": "Memories per page (default: 20, max: 100).",
+            },
+            "offset": {
+                "type": "integer",
+                "description": (
+                    "How many to skip; pass the previous call's offset + limit "
+                    "to get the next page while has_more is true."
+                ),
+            },
+        },
+    },
+}
+
 UPDATE_SCHEMA = {
     "name": "mem0_update",
     "description": (
@@ -491,8 +519,9 @@ class Mem0HermesMemoryProvider(MemoryProvider):
             "For multi-part or multi-hop questions, run several searches with "
             "different wording and follow up on what the first results surface; "
             "one search is rarely enough.\n"
-            "Tools: mem0_search to find memories, mem0_add to store facts, "
-            "mem0_update and mem0_delete to manage them by ID."
+            "Tools: mem0_search to find memories, mem0_get_all to list them "
+            "when the user wants to review everything you remember, mem0_add "
+            "to store facts, mem0_update and mem0_delete to manage them by ID."
         )
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
@@ -726,7 +755,9 @@ class Mem0HermesMemoryProvider(MemoryProvider):
     # -- Tools --------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [SEARCH_SCHEMA, ADD_SCHEMA, UPDATE_SCHEMA, DELETE_SCHEMA]
+        return [
+            SEARCH_SCHEMA, GET_ALL_SCHEMA, ADD_SCHEMA, UPDATE_SCHEMA, DELETE_SCHEMA,
+        ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         # Tool calls run inline on the agent loop (tool_executor.py), so this is
@@ -781,6 +812,43 @@ class Mem0HermesMemoryProvider(MemoryProvider):
                 for r in results
             ]
             return json.dumps({"results": items, "count": len(items)})
+
+        if tool_name == "mem0_get_all":
+            try:
+                limit = max(1, min(int(args.get("limit", 20)), 100))
+            except (TypeError, ValueError):
+                limit = 20
+            try:
+                offset = max(0, int(args.get("offset", 0)))
+            except (TypeError, ValueError):
+                offset = 0
+            try:
+                results, has_more = backend.get_all(
+                    filters=self._read_filters(), limit=limit, offset=offset
+                )
+                self._record_success()
+            except Exception as exc:
+                if not _is_client_error(exc):
+                    self._record_failure()
+                return _tool_error(f"Listing memories failed: {exc}")
+            if not results:
+                message = (
+                    "No memories past that offset."
+                    if offset
+                    else "No memories stored yet."
+                )
+                return json.dumps({"result": message})
+            items = [
+                {"id": r.get("id"), "memory": r.get("memory", "")} for r in results
+            ]
+            return json.dumps(
+                {
+                    "results": items,
+                    "count": len(items),
+                    "offset": offset,
+                    "has_more": has_more,
+                }
+            )
 
         if tool_name == "mem0_add":
             content = str(args.get("content") or "")

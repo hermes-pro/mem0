@@ -159,6 +159,57 @@ class MemoryConfigTranslationTests(unittest.TestCase):
                 os.environ["FASTEMBED_CACHE_PATH"] = saved
 
 
+class GetAllWindowTests(unittest.TestCase):
+    """Paging is sliced client-side, because Mem0 exposes no cursor."""
+
+    class _Memory:
+        def __init__(self, rows):
+            self.rows = rows
+            self.calls = []
+
+        def get_all(self, *, filters, top_k):
+            self.calls.append((filters, top_k))
+            return {"results": self.rows[:top_k]}
+
+    def _backend(self, count):
+        rows = [{"id": str(n), "memory": f"fact {n}"} for n in range(count)]
+        memory = self._Memory(rows)
+        # memory= bypasses build_memory, so this needs no mem0ai.
+        return _backend.HermesRoutedMem0Backend({}, memory=memory), memory
+
+    def test_over_fetches_one_row_to_detect_more(self):
+        backend, memory = self._backend(10)
+        window, has_more = backend.get_all(filters={"user_id": "u"}, limit=3)
+        self.assertEqual([r["id"] for r in window], ["0", "1", "2"])
+        self.assertTrue(has_more)
+        # limit + offset + 1: the extra row is what distinguishes "exactly a
+        # full page" from "there is more".
+        self.assertEqual(memory.calls[0][1], 4)
+
+    def test_offset_skips_and_over_fetches_accordingly(self):
+        backend, memory = self._backend(10)
+        window, has_more = backend.get_all(
+            filters={"user_id": "u"}, limit=3, offset=6
+        )
+        self.assertEqual([r["id"] for r in window], ["6", "7", "8"])
+        self.assertTrue(has_more)
+        self.assertEqual(memory.calls[0][1], 10)
+
+    def test_exactly_a_full_page_reports_no_more(self):
+        backend, _ = self._backend(3)
+        window, has_more = backend.get_all(filters={"user_id": "u"}, limit=3)
+        self.assertEqual(len(window), 3)
+        self.assertFalse(has_more)
+
+    def test_offset_past_the_end_is_empty(self):
+        backend, _ = self._backend(3)
+        window, has_more = backend.get_all(
+            filters={"user_id": "u"}, limit=3, offset=99
+        )
+        self.assertEqual(window, [])
+        self.assertFalse(has_more)
+
+
 class FakeEmbedder:
     """Deterministic stand-in so no embedding API is contacted."""
 
