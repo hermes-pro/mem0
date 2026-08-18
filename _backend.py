@@ -589,10 +589,10 @@ def build_memory(config: Dict[str, Any]):
     from ._hermes_llm import HermesRoutedLLM, RoutedLlmConfig, register_with_mem0
 
     memory_config = build_memory_config(config)
-    _settings = _concurrency_settings(config)
+    settings = _concurrency_settings(config)
     _reset_collection_if_dims_changed(
         memory_config["vector_store"],
-        retries=_settings["retries"], backoff=_settings["backoff"],
+        retries=settings["retries"], backoff=settings["backoff"],
     )
 
     from mem0.configs.base import MemoryConfig
@@ -613,7 +613,6 @@ def build_memory(config: Dict[str, Any]):
         injected = False
 
     store_path = local_store_path(config)
-    settings = _concurrency_settings(config)
     try:
         with _retrying_local_client(settings["retries"], settings["backoff"]):
             if injected:
