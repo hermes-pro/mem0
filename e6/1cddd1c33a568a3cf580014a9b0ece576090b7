@@ -1,0 +1,20 @@
+tests/test_config.py
+  s_6bd900efec2edd::t_fb6ae9abf06df8 18-32,40,47,290-302
+  s_6bd900efec2edd::t_1b7b32aaa0d232 303
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "e61cddd1c33a568a3cf580014a9b0ece576090b7",
+  "prompts": {},
+  "sessions": {
+    "s_6bd900efec2edd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57c3bc92-80ac-4b0c-85c0-f9204abd3a76",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
