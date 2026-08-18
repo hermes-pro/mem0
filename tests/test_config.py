@@ -301,6 +301,34 @@ class WizardTests(TempHomeTestCase):
             self.assertFalse(ok)
             self.assertIn(_config.NO_INSTALL_ENV, message)
 
+    def test_every_offered_embedder_has_a_default_model(self):
+        # The wizard offers EMBEDDER_CHOICES and fills the model field from
+        # EMBEDDER_DEFAULT_MODEL; a provider missing from the map leaves the
+        # user staring at an empty prompt with nothing to suggest.
+        missing = [
+            provider
+            for provider in _config.EMBEDDER_CHOICES
+            if not _config.EMBEDDER_DEFAULT_MODEL.get(provider)
+        ]
+        self.assertEqual(missing, [])
+
+    def test_default_embedder_models_get_a_vector_width(self):
+        # Qdrant creates the collection at embedding_model_dims and Mem0's
+        # default for that is 1536, so a default model of some other width has
+        # to state it or every write fails on a dimension mismatch.
+        for provider, model in _config.EMBEDDER_DEFAULT_MODEL.items():
+            with self.subTest(provider=provider):
+                config = _config.load_config(self.home)
+                config["embedder"] = {"provider": provider, "config": {"model": model}}
+                _config._backfill_embedding_dims(config)
+                dims = config["embedder"]["config"].get("embedding_dims")
+                if provider == "lmstudio":
+                    # Intentionally unstated; see EMBEDDER_DEFAULT_MODEL.
+                    self.assertIsNone(dims)
+                else:
+                    self.assertIsInstance(dims, int)
+                    self.assertGreater(dims, 0)
+
     def test_schema_covers_wizard_keys(self):
         keys = {field["key"] for field in _config.config_schema(_config.default_config(self.home))}
         self.assertTrue({"user_id", "llm_model", "embedder_provider"} <= keys)

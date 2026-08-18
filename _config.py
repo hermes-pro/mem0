@@ -94,11 +94,28 @@ DEFAULT_FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
 # test run can never mutate the interpreter it happens to be running under.
 NO_INSTALL_ENV = "MEM0_HERMES_NO_INSTALL"
 
+# One entry per EMBEDDER_CHOICES provider, so the wizard can offer a working
+# model for whatever the user picks instead of an empty prompt. Values are
+# Mem0 2.x's own per-embedder defaults (mem0/embeddings/*.py), except where a
+# smaller model is deliberately preferred — see DEFAULT_FASTEMBED_MODEL.
 EMBEDDER_DEFAULT_MODEL: Dict[str, str] = {
     "fastembed": DEFAULT_FASTEMBED_MODEL,
     "openai": "text-embedding-3-small",
     "ollama": "nomic-embed-text",
     "huggingface": "sentence-transformers/all-MiniLM-L6-v2",
+    # Azure resolves the deployment, not the model name, but the width still
+    # has to be right and deployments usually mirror the model they serve.
+    "azure_openai": "text-embedding-3-small",
+    "gemini": "models/gemini-embedding-001",
+    "together": "intfloat/multilingual-e5-large-instruct",
+    "aws_bedrock": "amazon.titan-embed-text-v1",
+    # Deliberately absent from KNOWN_DIMS: Mem0 declares 1536 for this model
+    # while nomic-embed-text-v1.5 is natively 768, and which one LM Studio
+    # actually serves depends on how the GGUF is loaded. Leaving the width
+    # unstated defers to Mem0 rather than committing to a guess — a wrong
+    # embedding_dims doesn't fail loudly, it builds a mis-sized collection and
+    # then fails every write.
+    "lmstudio": "nomic-ai/nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.f16.gguf",
 }
 
 # Python packages each embedder needs, installed only for the provider actually
@@ -129,6 +146,12 @@ KNOWN_DIMS: Dict[str, int] = {
     "intfloat/multilingual-e5-large": 1024,
     "sentence-transformers/all-MiniLM-L6-v2": 384,
     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2": 384,
+    "multi-qa-MiniLM-L6-cos-v1": 384,
+    # Requested explicitly by Mem0 via output_dimensionality; the model can
+    # emit wider vectors, so this is not a property of the model alone.
+    "models/gemini-embedding-001": 768,
+    "intfloat/multilingual-e5-large-instruct": 1024,
+    "amazon.titan-embed-text-v1": 1536,
 }
 EMBEDDER_BASE_URL_KEY: Dict[str, str] = {
     "openai": "openai_base_url",
