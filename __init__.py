@@ -199,6 +199,7 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
         self._atexit_registered = False
+        self._unavailable_reason = ""
 
     # -- Identity / availability --------------------------------------------
 
@@ -218,12 +219,22 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         """
         from . import _config as cfgmod
 
+        self._unavailable_reason = ""
         try:
             config = cfgmod.load_config()
         except Exception as exc:
+            self._unavailable_reason = (
+                f"{cfgmod.CONFIG_FILENAME} in {cfgmod.hermes_home()} could not "
+                f"be read ({exc}). Fix the JSON, or delete it and run "
+                "`hermes memory setup`."
+            )
             logger.warning("mem0_hermes: config could not be read: %s", exc)
             return False
         if not (config.get("vector_store") or {}).get("provider"):
+            self._unavailable_reason = (
+                "no vector_store.provider is configured; run "
+                "`hermes memory setup` to pick one."
+            )
             logger.warning("mem0_hermes: no vector_store configured")
             return False
         missing = cfgmod.embedder_key_missing(config)
@@ -235,6 +246,16 @@ class Mem0HermesMemoryProvider(MemoryProvider):
                 (config.get("embedder") or {}).get("provider"), missing,
             )
         return True
+
+    def unavailable_reason(self) -> str:
+        """Why :meth:`is_available` said no, for the caller's warning.
+
+        An unavailable provider is never initialized, so nothing this plugin
+        would log from ``initialize()`` is reachable — without this the user
+        sees "provider unavailable" and has to guess between a malformed config
+        file and an unconfigured vector store.
+        """
+        return self._unavailable_reason
 
     # -- Setup --------------------------------------------------------------
 

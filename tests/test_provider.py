@@ -167,6 +167,44 @@ class AvailabilityTests(ProviderTestCase):
             if saved is not None:
                 os.environ["OPENAI_API_KEY"] = saved
 
+    def test_malformed_config_file_still_leaves_the_provider_available(self):
+        # _read_json skips a file it can't parse, so the defaults still resolve
+        # to a working local setup. Nothing to report.
+        (self.home / "mem0_hermes.json").write_text("{not json", encoding="utf-8")
+        provider = Mem0HermesMemoryProvider()
+        self.assertTrue(provider.is_available())
+        self.assertEqual(provider.unavailable_reason(), "")
+
+    def test_unavailable_reason_names_a_missing_vector_store(self):
+        provider = Mem0HermesMemoryProvider()
+        self.assertEqual(provider.unavailable_reason(), "")
+        with mock.patch(
+            "mem0_hermes._config.load_config", return_value={"vector_store": {}}
+        ):
+            self.assertFalse(provider.is_available())
+        reason = provider.unavailable_reason()
+        self.assertIn("vector_store", reason)
+        self.assertIn("hermes memory setup", reason)
+
+    def test_unavailable_reason_names_an_unreadable_config(self):
+        provider = Mem0HermesMemoryProvider()
+        with mock.patch(
+            "mem0_hermes._config.load_config", side_effect=OSError("permission denied")
+        ):
+            self.assertFalse(provider.is_available())
+        reason = provider.unavailable_reason()
+        self.assertIn("mem0_hermes.json", reason)
+        self.assertIn("permission denied", reason)
+
+    def test_unavailable_reason_clears_once_available(self):
+        provider = Mem0HermesMemoryProvider()
+        with mock.patch(
+            "mem0_hermes._config.load_config", return_value={"vector_store": {}}
+        ):
+            self.assertFalse(provider.is_available())
+        self.assertTrue(provider.is_available())
+        self.assertEqual(provider.unavailable_reason(), "")
+
     def test_missing_embedder_key_reported_through_tool_errors(self):
         (self.home / "mem0_hermes.json").write_text(
             json.dumps({"embedder": {"provider": "openai", "config": {}}}),
