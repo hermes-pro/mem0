@@ -39,10 +39,13 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 # Sentinel user_id. Treated as "operator did not configure one", so the
 # gateway-native id (Telegram numeric id, Discord snowflake, …) still wins.
@@ -304,15 +307,45 @@ def _env_overrides() -> Dict[str, Any]:
         ("MEM0_HERMES_LLM_PROVIDER", "provider"),
         ("MEM0_HERMES_LLM_MODEL", "model"),
         ("MEM0_HERMES_LLM_BASE_URL", "base_url"),
+        ("MEM0_HERMES_LLM_API_KEY", "api_key"),
         ("MEM0_HERMES_LLM_TASK", "task"),
         ("MEM0_HERMES_JSON_MODE", "json_mode"),
     ):
         value = os.environ.get(env_name, "").strip()
         if value:
             llm[key] = value
+
+    for env_name, key, cast in (
+        ("MEM0_HERMES_LLM_TEMPERATURE", "temperature", float),
+        ("MEM0_HERMES_LLM_MAX_TOKENS", "max_tokens", int),
+        ("MEM0_HERMES_LLM_TIMEOUT", "timeout", float),
+    ):
+        number = _env_number(env_name, cast)
+        if number is not None:
+            llm[key] = number
+
     if llm:
         out["llm"] = llm
     return out
+
+
+def _env_number(env_name: str, cast) -> Any:
+    """Parse a numeric env override, or ``None`` when unset or unparseable.
+
+    A malformed value is reported rather than dropped: environment overrides
+    exist to be set from shell profiles and unit files, where a typo would
+    otherwise take effect as "the default" with nothing to point at.
+    """
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return None
+    try:
+        return cast(raw)
+    except ValueError:
+        logger.warning(
+            "mem0_hermes: ignoring %s=%r — expected %s", env_name, raw, cast.__name__
+        )
+        return None
 
 
 def _drop_inherited_dims(base: Dict[str, Any], overlay: Dict[str, Any]) -> None:

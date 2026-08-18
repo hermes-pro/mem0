@@ -161,10 +161,27 @@ checkout directory name doesn't matter; the destination is always
 
 Config resolution, lowest precedence first: built-in defaults → an existing
 bundled-`mem0` OSS setup in `mem0.json` (embedder + vector store + ids, so you
-keep reading the same memories) → `mem0_hermes.json` → environment
-(`MEM0_HERMES_LLM_MODEL`, `MEM0_HERMES_LLM_PROVIDER`, `MEM0_HERMES_USER_ID`,
-`MEM0_HERMES_AGENT_ID`, `MEM0_HERMES_JSON_MODE`, …; the bundled `MEM0_USER_ID` /
-`MEM0_AGENT_ID` are honored too).
+keep reading the same memories) → `mem0_hermes.json` → environment.
+
+Every `llm` key has an environment override, so the whole extraction route can
+be set from a shell profile or a unit file without writing the config file:
+
+| Variable | Sets |
+| --- | --- |
+| `MEM0_HERMES_USER_ID` | `user_id` (the bundled `MEM0_USER_ID` is honored too) |
+| `MEM0_HERMES_AGENT_ID` | `agent_id` (likewise `MEM0_AGENT_ID`) |
+| `MEM0_HERMES_LLM_PROVIDER` | `llm.provider` |
+| `MEM0_HERMES_LLM_MODEL` | `llm.model` |
+| `MEM0_HERMES_LLM_BASE_URL` | `llm.base_url` |
+| `MEM0_HERMES_LLM_API_KEY` | `llm.api_key` |
+| `MEM0_HERMES_LLM_TASK` | `llm.task` |
+| `MEM0_HERMES_JSON_MODE` | `llm.json_mode` |
+| `MEM0_HERMES_LLM_TEMPERATURE` | `llm.temperature` |
+| `MEM0_HERMES_LLM_MAX_TOKENS` | `llm.max_tokens` |
+| `MEM0_HERMES_LLM_TIMEOUT` | `llm.timeout` |
+
+The three numeric ones are parsed as numbers; an unparseable value is logged and
+ignored rather than silently taking effect as the default.
 
 ### Choosing the extraction model
 

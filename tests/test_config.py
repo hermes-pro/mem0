@@ -129,6 +129,43 @@ class OverrideTests(TempHomeTestCase):
         os.environ["MEM0_HERMES_LLM_MODEL"] = "from-env"
         self.assertEqual(_config.load_config(self.home)["llm"]["model"], "from-env")
 
+    def test_env_covers_every_llm_key(self):
+        os.environ.update(
+            {
+                "MEM0_HERMES_LLM_PROVIDER": "anthropic",
+                "MEM0_HERMES_LLM_MODEL": "claude-opus-5",
+                "MEM0_HERMES_LLM_BASE_URL": "https://example.invalid",
+                "MEM0_HERMES_LLM_API_KEY": "sk-env",
+                "MEM0_HERMES_LLM_TASK": "custom_task",
+                "MEM0_HERMES_JSON_MODE": "response_format",
+                "MEM0_HERMES_LLM_TEMPERATURE": "0.7",
+                "MEM0_HERMES_LLM_MAX_TOKENS": "512",
+                "MEM0_HERMES_LLM_TIMEOUT": "45",
+            }
+        )
+        llm = _config.load_config(self.home)["llm"]
+        self.assertEqual(llm["provider"], "anthropic")
+        self.assertEqual(llm["model"], "claude-opus-5")
+        self.assertEqual(llm["base_url"], "https://example.invalid")
+        self.assertEqual(llm["api_key"], "sk-env")
+        self.assertEqual(llm["task"], "custom_task")
+        self.assertEqual(llm["json_mode"], "response_format")
+        self.assertEqual(llm["temperature"], 0.7)
+        self.assertEqual(llm["max_tokens"], 512)
+        self.assertEqual(llm["timeout"], 45.0)
+
+    def test_numeric_env_overrides_are_typed_not_strings(self):
+        os.environ["MEM0_HERMES_LLM_MAX_TOKENS"] = "512"
+        llm = _config.load_config(self.home)["llm"]
+        self.assertIsInstance(llm["max_tokens"], int)
+
+    def test_malformed_numeric_env_falls_back_to_the_default(self):
+        os.environ["MEM0_HERMES_LLM_TEMPERATURE"] = "warm"
+        with self.assertLogs("mem0_hermes._config", level="WARNING") as logs:
+            llm = _config.load_config(self.home)["llm"]
+        self.assertEqual(llm["temperature"], 0.1)
+        self.assertIn("MEM0_HERMES_LLM_TEMPERATURE", "".join(logs.output))
+
     def test_inherits_embedder_and_vector_store_from_bundled_mem0(self):
         self.write_config(
             {
