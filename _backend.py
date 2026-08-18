@@ -516,7 +516,7 @@ def _reset_collection_if_dims_changed(
                 current = getattr(vectors, "size", None)
             if current is not None and int(current) != int(expected):
                 logger.warning(
-                    "mem0_hermes: embedding dims changed (%s → %s); recreating "
+                    "mem0_hermes: embedding dims changed (%s -> %s); recreating "
                     "Qdrant collection %r",
                     current, expected, collection,
                 )
@@ -654,7 +654,7 @@ def build_memory(config: Dict[str, Any]):
         if settings["idle_seconds"] > 0:
             logger.info(
                 "mem0_hermes: embedded Qdrant at %s is leased with a %.1fs idle "
-                "release — consecutive calls share one open, and other Hermes "
+                "release -- consecutive calls share one open, and other Hermes "
                 "processes may wait that long to get in",
                 store_path, settings["idle_seconds"],
             )

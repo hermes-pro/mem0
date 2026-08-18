@@ -366,7 +366,7 @@ def _env_number(env_name: str, cast) -> Any:
         return cast(raw)
     except ValueError:
         logger.warning(
-            "mem0_hermes: ignoring %s=%r — expected %s", env_name, raw, cast.__name__
+            "mem0_hermes: ignoring %s=%r -- expected %s", env_name, raw, cast.__name__
         )
         return None
 

@@ -346,6 +346,33 @@ class WizardTests(TempHomeTestCase):
                     self.assertIsInstance(dims, int)
                     self.assertGreater(dims, 0)
 
+    def test_log_messages_are_encodable_by_a_legacy_console(self):
+        # logging doesn't crash on an unencodable record, it swallows it and
+        # prints "--- Logging error ---" instead -- so a non-ASCII log message
+        # simply vanishes wherever stderr is redirected and the locale
+        # encoding is cp1252, which is CI and any Hermes log file on Windows.
+        import ast
+
+        offenders = []
+        for name in ("_config.py", "__init__.py", "_backend.py", "_hermes_llm.py"):
+            path = Path(__file__).resolve().parents[1] / name
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "logger"
+                ):
+                    continue
+                for part in ast.walk(node):
+                    if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                        try:
+                            part.value.encode("cp1252")
+                        except UnicodeEncodeError:
+                            offenders.append(f"{name}:{node.lineno}")
+        self.assertEqual(sorted(set(offenders)), [])
+
     def test_emit_degrades_the_status_marks_it_cannot_encode(self):
         log = Cp1252Log()
         _config._emit(log, f"  {_config._OK_MARK} installed fastembed")

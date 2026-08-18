@@ -270,7 +270,7 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         missing = cfgmod.embedder_key_missing(config)
         if missing:
             logger.warning(
-                "mem0_hermes: embedder provider %r needs %s — memory writes will "
+                "mem0_hermes: embedder provider %r needs %s -- memory writes will "
                 "fail until it is set (or switch to a local embedder with "
                 "`hermes memory setup`)",
                 (config.get("embedder") or {}).get("provider"), missing,
