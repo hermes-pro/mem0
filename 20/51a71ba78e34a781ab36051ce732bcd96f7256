@@ -1,0 +1,21 @@
+tests/test_provider.py
+  s_6bd900efec2edd::t_771c2bafdbd601 602-606
+tests/test_plugin_loading.py
+  s_6bd900efec2edd::t_771c2bafdbd601 44-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "2051a71ba78e34a781ab36051ce732bcd96f7256",
+  "prompts": {},
+  "sessions": {
+    "s_6bd900efec2edd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57c3bc92-80ac-4b0c-85c0-f9204abd3a76",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
