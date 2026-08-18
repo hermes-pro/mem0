@@ -456,22 +456,32 @@ class Mem0HermesMemoryProvider(MemoryProvider):
             body = ""
             try:
                 backend = self._await_backend(_PREFETCH_WAIT_SECS)
-                if backend is None:
-                    return
-                results = backend.search(
-                    query, filters=self._read_filters(), top_k=10, rerank=False
-                )
-                lines = [r.get("memory", "") for r in (results or []) if r.get("memory")]
-                if lines:
-                    body = "## Mem0 Memory\n" + "\n".join(f"- {line}" for line in lines)
-                self._record_success()
+                if backend is not None:
+                    results = backend.search(
+                        query, filters=self._read_filters(), top_k=10, rerank=False
+                    )
+                    lines = [
+                        r.get("memory", "") for r in (results or []) if r.get("memory")
+                    ]
+                    if lines:
+                        body = "## Mem0 Memory\n" + "\n".join(
+                            f"- {line}" for line in lines
+                        )
+                    self._record_success()
             except Exception as exc:
                 self._record_failure()
                 logger.debug("mem0_hermes: prefetch failed: %s", exc)
-            with self._prefetch_lock:
-                if self._prefetch_query == query:
-                    self._prefetch_result = body
-                    self._prefetch_done = True
+            finally:
+                # Unconditional, including the backend-not-ready path: an empty
+                # body IS the answer ("nothing to inject, fall back to
+                # mem0_search"). Leaving the flag unset instead makes the next
+                # prefetch() see a finished-but-not-done worker and start a
+                # second one, spending _PREFETCH_WAIT_SECS all over again on
+                # the hot path.
+                with self._prefetch_lock:
+                    if self._prefetch_query == query:
+                        self._prefetch_result = body
+                        self._prefetch_done = True
 
         thread = threading.Thread(target=_run, daemon=True, name="mem0-hermes-prefetch")
         with self._prefetch_lock:

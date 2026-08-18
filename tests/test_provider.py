@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import _bootstrap  # noqa: F401 - sys.path bootstrap
 
@@ -289,6 +290,40 @@ class TurnLifecycleTests(ProviderTestCase):
         before = len(backend.searches)
         provider.prefetch("tea?")
         self.assertGreater(len(backend.searches), before)
+
+    def test_prefetch_budget_is_spent_once_when_the_backend_is_slow(self):
+        # The worker gives up waiting for a backend that is still building. It
+        # must still publish that "nothing to inject" answer, or the next
+        # prefetch() sees a finished-but-not-done worker, starts a second one,
+        # and blocks the hot path for the whole budget a second time.
+        import mem0_hermes as plugin
+
+        provider = Mem0HermesMemoryProvider()
+        self.addCleanup(provider.shutdown)
+        provider._init_started = True  # initialize() ran; the build is in flight
+
+        with mock.patch.object(plugin, "_PREFETCH_WAIT_SECS", 0.2):
+            provider.on_turn_start(1, "tea?")
+            provider._prefetch_thread.join(timeout=5)
+            self.assertTrue(provider._prefetch_done)
+
+            started = time.monotonic()
+            self.assertEqual(provider.prefetch("tea?"), "")
+            elapsed = time.monotonic() - started
+
+        self.assertLess(
+            elapsed, 0.2, "prefetch restarted the worker and waited a second time"
+        )
+
+    def test_prefetch_retries_on_a_later_turn(self):
+        # Publishing the give-up must not latch: once the backend is up, the
+        # next turn prefetches normally.
+        backend = FakeBackend(results=[{"memory": "likes tea"}])
+        provider, _ = self.make_provider(backend)
+        provider.on_turn_start(1, "tea?")
+        self.assertIn("likes tea", provider.prefetch("tea?"))
+        provider.on_turn_start(2, "coffee?")
+        self.assertIn("likes tea", provider.prefetch("coffee?"))
 
     def test_prefetch_failure_is_silent_but_counted(self):
         backend = FakeBackend(error=RuntimeError("vector store down"))
