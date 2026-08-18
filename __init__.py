@@ -284,8 +284,20 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         try:
             backend = self._create_backend()
         finally:
-            self._backend = backend
+            previous, self._backend = self._backend, backend
             self._backend_ready.set()
+        # A second initialize() (a gateway starting another session, a rebuild
+        # after a provider error) takes a second reference from
+        # acquire_backend's registry — usually to the very same shared object,
+        # since sharing is keyed on the storage path. Dropping the old
+        # reference here is what keeps this provider holding exactly one:
+        # without it the refcount never reaches zero, shutdown() closes
+        # nothing, and the embedded Qdrant directory stays locked against every
+        # other Hermes process until the interpreter exits. Released after the
+        # swap, so nothing waiting on _backend_ready can observe a released
+        # backend.
+        if previous is not None:
+            self._release(previous)
         if backend is not None and not self._atexit_registered:
             atexit.register(self._shutdown_backend)
             self._atexit_registered = True
@@ -331,10 +343,8 @@ class Mem0HermesMemoryProvider(MemoryProvider):
             logger.error("mem0_hermes: backend failed to initialize: %s", exc)
             return None
 
-    def _shutdown_backend(self) -> None:
-        backend, self._backend = self._backend, None
-        if backend is None:
-            return
+    def _release(self, backend) -> None:
+        """Drop one reference to ``backend``; the registry closes it at zero."""
         try:
             from . import _backend as backend_mod
 
@@ -344,6 +354,12 @@ class Mem0HermesMemoryProvider(MemoryProvider):
                 backend.close()
             except Exception:
                 pass
+
+    def _shutdown_backend(self) -> None:
+        backend, self._backend = self._backend, None
+        if backend is None:
+            return
+        self._release(backend)
 
     def shutdown(self) -> None:
         # The builder first: closing a store that is still being constructed

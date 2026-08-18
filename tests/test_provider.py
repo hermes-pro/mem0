@@ -367,6 +367,25 @@ class TurnLifecycleTests(ProviderTestCase):
         provider.shutdown()
         self.assertTrue(backend.closed)
 
+    def test_reinitialize_does_not_leak_a_backend_reference(self):
+        # acquire_backend refcounts one shared owner per storage path, so a
+        # second initialize() hands back the same object with the count bumped.
+        # If the first reference is never dropped the count never reaches zero,
+        # shutdown() closes nothing, and the embedded Qdrant directory stays
+        # locked against every other Hermes process until the interpreter exits.
+        provider, backend = self.make_provider()
+        key = _backend._share_key(provider._config)
+        self.assertIs(_backend._OWNERS.get(key), backend)
+
+        provider.initialize("session-2", hermes_home=str(self.home))
+        provider._backend_thread.join(timeout=10)
+        self.assertIs(provider._backend, backend)
+        self.assertEqual(backend._refcount, 1)
+
+        provider.shutdown()
+        self.assertTrue(backend.closed)
+        self.assertNotIn(key, _backend._OWNERS)
+
 
 BUILD_SECONDS = 0.6
 
