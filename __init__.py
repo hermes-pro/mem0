@@ -553,7 +553,19 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """Hand the turn to Mem0 for extraction on the Hermes model (async)."""
+        """Hand the turn to Mem0 for extraction on the Hermes model (async).
+
+        ``messages`` is accepted to satisfy the ``MemoryProvider`` contract and
+        deliberately ignored. It is the whole OpenAI-style conversation as of
+        this turn — every earlier turn, plus assistant tool calls and tool
+        results — not the turn alone. Passing it to ``Memory.add`` would
+        re-extract the entire history on every turn (quadratic model spend, and
+        Mem0's dedup pass asked to re-decide every prior fact each time), and
+        would mine tool output for "user facts": a file listing or an API
+        response read as something the user said about themselves. The
+        user/assistant pair is the turn's actual new content, so that is what
+        gets extracted. The ABC explicitly allows ignoring it.
+        """
         if self._is_breaker_open():
             return
         if not (user_content or assistant_content):

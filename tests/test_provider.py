@@ -412,6 +412,33 @@ class TurnLifecycleTests(ProviderTestCase):
             for index in range(overflow, plugin._SYNC_QUEUE_MAX + overflow)
         ])
 
+    def test_sync_turn_ignores_the_full_conversation_history(self):
+        # MemoryProvider passes the entire conversation as of this turn --
+        # earlier turns, assistant tool calls, tool results. Extracting from it
+        # would re-mine the whole history every turn and read tool output as
+        # facts about the user; only the turn's own content is written.
+        provider, backend = self.make_provider()
+        provider.sync_turn(
+            "I drink dark roast",
+            "Noted.",
+            messages=[
+                {"role": "user", "content": "an old turn"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
+                {"role": "tool", "content": "/etc/passwd contents"},
+                {"role": "user", "content": "I drink dark roast"},
+                {"role": "assistant", "content": "Noted."},
+            ],
+        )
+        self.wait_for_sync(provider)
+        self.assertEqual(len(backend.adds), 1)
+        self.assertEqual(
+            backend.adds[0]["messages"],
+            [
+                {"role": "user", "content": "I drink dark roast"},
+                {"role": "assistant", "content": "Noted."},
+            ],
+        )
+
     def test_sync_turn_skips_empty_turns(self):
         provider, backend = self.make_provider()
         provider.sync_turn("", "")
