@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -73,6 +74,20 @@ class FakeBackend:
         self.closed = True
 
 
+class BlockingBackend(FakeBackend):
+    """Parks inside add() until released, so a write can be held in flight."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def add(self, messages, **kwargs):
+        self.entered.set()
+        self.release.wait(timeout=10)
+        return super().add(messages, **kwargs)
+
+
 class ProviderTestCase(unittest.TestCase):
     """Provider tests against a temporary HERMES_HOME and a fake backend."""
 
@@ -113,6 +128,15 @@ class ProviderTestCase(unittest.TestCase):
 
     def _restore_backend_cls(self):
         _backend.HermesRoutedMem0Backend = self._saved_backend_cls
+
+    def wait_for_sync(self, provider, timeout=10.0):
+        """Block until the extraction worker has drained everything queued."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if provider.sync_idle():
+                return
+            time.sleep(0.01)
+        self.fail("queued turns were not extracted in time")
 
     def make_provider(self, backend=None, **init_kwargs):
         backend = backend if backend is not None else FakeBackend()
@@ -335,11 +359,58 @@ class TurnLifecycleTests(ProviderTestCase):
     def test_sync_turn_sends_both_roles_with_inference(self):
         provider, backend = self.make_provider()
         provider.sync_turn("I drink dark roast", "Noted.")
-        provider._sync_thread.join(timeout=5)
+        self.wait_for_sync(provider)
         self.assertEqual(len(backend.adds), 1)
         call = backend.adds[0]
         self.assertTrue(call["infer"])  # extraction runs on the Hermes model
         self.assertEqual([m["role"] for m in call["messages"]], ["user", "assistant"])
+
+    def test_sync_turn_does_not_block_the_caller(self):
+        # The previous implementation joined the running sync thread for up to
+        # 5s on the caller's thread and then discarded the turn.
+        backend = BlockingBackend()
+        provider, _ = self.make_provider(backend)
+        provider.sync_turn("first", "ok")
+        self.assertTrue(backend.entered.wait(timeout=5))
+
+        started = time.monotonic()
+        provider.sync_turn("second", "ok")
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.5)
+
+        backend.release.set()
+        self.wait_for_sync(provider)
+        # ...and the turn that arrived mid-extraction was written, not dropped.
+        self.assertEqual(len(backend.adds), 2)
+        self.assertEqual(
+            [call["messages"][0]["content"] for call in backend.adds],
+            ["first", "second"],
+        )
+
+    def test_queue_drops_the_oldest_turn_when_extraction_falls_behind(self):
+        import mem0_hermes as plugin
+
+        backend = BlockingBackend()
+        provider, _ = self.make_provider(backend)
+        provider.sync_turn("in flight", "ok")
+        self.assertTrue(backend.entered.wait(timeout=5))
+
+        overflow = 2
+        for index in range(plugin._SYNC_QUEUE_MAX + overflow):
+            provider.sync_turn(f"turn {index}", "ok")
+        backend.release.set()
+        self.wait_for_sync(provider)
+
+        written = [call["messages"][0]["content"] for call in backend.adds]
+        self.assertEqual(provider._sync_dropped, overflow)
+        self.assertEqual(written[0], "in flight")
+        # The oldest queued turns go; the newest are kept and stay in order.
+        self.assertNotIn("turn 0", written)
+        self.assertNotIn("turn 1", written)
+        self.assertEqual(written[1:], [
+            f"turn {index}"
+            for index in range(overflow, plugin._SYNC_QUEUE_MAX + overflow)
+        ])
 
     def test_sync_turn_skips_empty_turns(self):
         provider, backend = self.make_provider()
@@ -456,7 +527,7 @@ class BackgroundInitTests(ProviderTestCase):
     def test_sync_turn_waits_for_the_backend(self):
         provider, backend, _elapsed = self._slow_provider()
         provider.sync_turn("I drink dark roast", "Noted.")
-        provider._sync_thread.join(timeout=10)
+        self.wait_for_sync(provider)
         self.assertEqual(len(backend.adds), 1)
 
     def test_system_prompt_never_blocks(self):

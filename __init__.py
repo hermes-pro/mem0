@@ -20,12 +20,20 @@ Activate with ``memory.provider: mem0_hermes`` in ``config.yaml``, or by running
 
 Lifecycle behavior (prefetch-with-short-wait, background turn sync, and the
 consecutive-failure circuit breaker) follows the bundled ``plugins/memory/mem0``
-provider so the two behave identically from the agent's point of view. One
-addition: the backend is built on a background thread, because ``initialize()``
-runs inline on Hermes's session-startup path and building it costs ~1.5 s —
-mostly importing ``qdrant_client`` and ``fastembed``, not the embedding model,
-which is ~200 ms of that. Consumers wait for readiness where it matters instead — prefetch inside
-its existing budget, tool calls and turn sync in their own threads.
+provider so the two behave identically from the agent's point of view, with two
+departures:
+
+* The backend is built on a background thread, because ``initialize()`` runs
+  inline on Hermes's session-startup path and building it costs ~1.5 s — mostly
+  importing ``qdrant_client`` and ``fastembed``, not the embedding model, which
+  is ~200 ms of that. Consumers wait for readiness where it matters instead:
+  prefetch inside its existing budget, tool calls and turn sync in their own
+  threads.
+* Turn sync is queued to one long-lived worker rather than started per turn.
+  Extraction is an LLM call, so a burst of short turns outruns it; the bundled
+  provider discards the turns that arrive meanwhile, which loses memories from
+  exactly the fast back-and-forth where they matter. Queued turns are extracted
+  in order and only dropped once the backlog exceeds ``_SYNC_QUEUE_MAX``.
 """
 
 from __future__ import annotations
@@ -35,7 +43,8 @@ import json
 import logging
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from agent.memory_provider import MemoryProvider
 
@@ -52,6 +61,15 @@ _PREFETCH_WAIT_SECS = 3
 # Mem0/qdrant-client/fastembed imports) and the alternative is telling the model
 # memory is unavailable.
 _BACKEND_WAIT_SECS = 30
+
+# Turns waiting to be extracted. Extraction is an LLM call, so a burst of short
+# turns can outrun it; queueing lets them catch up instead of being thrown away.
+# Bounded because the alternative to dropping under sustained overload is
+# unbounded memory growth and an ever-staler backlog — and the oldest turn is
+# the least useful one to keep.
+_SYNC_QUEUE_MAX = 8
+# How long shutdown waits for the worker to finish the write in flight.
+_SYNC_SHUTDOWN_WAIT_SECS = 5.0
 
 _CLIENT_ERROR_TYPES = ("MemoryNotFoundError", "ValidationError", "ValueError")
 
@@ -166,7 +184,11 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         self._prefetch_done = False
         self._prefetch_lock = threading.Lock()
         self._sync_thread: Optional[threading.Thread] = None
-        self._sync_lock = threading.Lock()
+        self._sync_cond = threading.Condition()
+        self._sync_queue: Deque[Tuple[str, str]] = deque()
+        self._sync_busy = False
+        self._sync_stopping = False
+        self._sync_dropped = 0
         self._breaker_lock = threading.Lock()
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
@@ -263,6 +285,10 @@ class Mem0HermesMemoryProvider(MemoryProvider):
 
         self._backend_ready.clear()
         self._init_started = True
+        with self._sync_cond:
+            # A provider reused after shutdown() (the gateway rebuilds one on
+            # provider error) must accept turns again.
+            self._sync_stopping = False
         if background:
             # Building the backend costs ~1.5 s — dominated by importing
             # qdrant_client (~1.25 s, pydantic model construction) and fastembed
@@ -366,12 +392,13 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         # would race the construction, and the workers below may be waiting on it.
         if self._backend_thread is not None and self._backend_thread.is_alive():
             self._backend_thread.join(timeout=_BACKEND_WAIT_SECS)
-        for thread in (self._prefetch_thread, self._sync_thread):
-            if thread is not None and thread.is_alive():
-                thread.join(timeout=5.0)
-        # Unblocks anything still waiting: they see no backend and give up
-        # instead of sitting out their full timeout during shutdown.
+        # Before joining the workers, not after: a worker parked in
+        # _await_backend would otherwise sit out its full timeout while
+        # shutdown waits on it. Set, they see no backend and give up.
         self._backend_ready.set()
+        self._stop_sync_worker()
+        if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+            self._prefetch_thread.join(timeout=5.0)
         self._shutdown_backend()
 
     # -- Circuit breaker ----------------------------------------------------
@@ -540,37 +567,99 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         if self._backend is None and self._backend_ready.is_set():
             return  # the build finished and failed; nothing to write to
 
-        def _sync() -> None:
-            backend = self._await_backend(_BACKEND_WAIT_SECS)
-            if backend is None:
+        with self._sync_cond:
+            if self._sync_stopping:
                 return
-            try:
-                backend.add(
-                    [
-                        {"role": "user", "content": user_content},
-                        {"role": "assistant", "content": assistant_content},
-                    ],
-                    user_id=self._user_id,
-                    agent_id=self._agent_id,
-                    infer=True,
-                    metadata=self._write_metadata(),
+            if len(self._sync_queue) >= _SYNC_QUEUE_MAX:
+                # Oldest first: it is the least useful turn to keep, and the
+                # backlog is already staler than whatever is arriving now.
+                self._sync_queue.popleft()
+                self._sync_dropped += 1
+                logger.warning(
+                    "mem0_hermes: extraction is %d turns behind; dropped the "
+                    "oldest queued turn (%d dropped this session). The routed "
+                    "model (%s) is slower than the conversation.",
+                    _SYNC_QUEUE_MAX, self._sync_dropped, self._routing_label(),
                 )
-                self._record_success()
-            except Exception as exc:
-                self._record_failure()
-                logger.warning("mem0_hermes: turn sync failed: %s", exc)
+            self._sync_queue.append((user_content, assistant_content))
+            self._ensure_sync_worker()
+            self._sync_cond.notify()
 
-        with self._sync_lock:
-            if self._sync_thread is not None and self._sync_thread.is_alive():
-                self._sync_thread.join(timeout=5.0)
-            # Still running: skip rather than risk double ingestion of a turn.
-            if self._sync_thread is not None and self._sync_thread.is_alive():
-                logger.debug("mem0_hermes: previous sync still running; skipping turn")
-                return
-            self._sync_thread = threading.Thread(
-                target=_sync, daemon=True, name="mem0-hermes-sync"
+    def _ensure_sync_worker(self) -> None:
+        """Start the extraction worker if it isn't running. Call under the lock."""
+        if self._sync_thread is not None and self._sync_thread.is_alive():
+            return
+        self._sync_thread = threading.Thread(
+            target=self._sync_worker, daemon=True, name="mem0-hermes-sync"
+        )
+        self._sync_thread.start()
+
+    def _sync_worker(self) -> None:
+        """Drain queued turns one at a time, in order.
+
+        One worker rather than one thread per turn: Mem0's add is a
+        read-decide-write cycle over a shared store, so overlapping extractions
+        can each work from a snapshot taken before the other's write and
+        duplicate a fact.
+        """
+        while True:
+            with self._sync_cond:
+                while not self._sync_queue and not self._sync_stopping:
+                    self._sync_cond.wait()
+                if self._sync_stopping:
+                    return
+                turn = self._sync_queue.popleft()
+                self._sync_busy = True
+            try:
+                self._write_turn(turn)
+            except Exception as exc:  # pragma: no cover - _write_turn catches
+                logger.warning("mem0_hermes: sync worker error: %s", exc)
+            finally:
+                with self._sync_cond:
+                    self._sync_busy = False
+                    self._sync_cond.notify_all()
+
+    def _write_turn(self, turn: Tuple[str, str]) -> None:
+        user_content, assistant_content = turn
+        backend = self._await_backend(_BACKEND_WAIT_SECS)
+        if backend is None:
+            return
+        try:
+            backend.add(
+                [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": assistant_content},
+                ],
+                user_id=self._user_id,
+                agent_id=self._agent_id,
+                infer=True,
+                metadata=self._write_metadata(),
             )
-            self._sync_thread.start()
+            self._record_success()
+        except Exception as exc:
+            self._record_failure()
+            logger.warning("mem0_hermes: turn sync failed: %s", exc)
+
+    def _stop_sync_worker(self) -> None:
+        with self._sync_cond:
+            self._sync_stopping = True
+            thread = self._sync_thread
+            self._sync_cond.notify_all()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=_SYNC_SHUTDOWN_WAIT_SECS)
+        with self._sync_cond:
+            pending = len(self._sync_queue)
+            self._sync_queue.clear()
+        if pending:
+            logger.warning(
+                "mem0_hermes: %d queued turn(s) were not extracted before "
+                "shutdown", pending,
+            )
+
+    def sync_idle(self) -> bool:
+        """True when nothing is queued and no extraction is in flight."""
+        with self._sync_cond:
+            return not self._sync_queue and not self._sync_busy
 
     # -- Tools --------------------------------------------------------------
 

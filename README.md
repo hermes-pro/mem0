@@ -211,7 +211,7 @@ of. Measured on this machine with the fastembed default:
 | First turn's `prefetch()` | up to the build (~1.5 s), capped at 3 s | Waits for the backend so the first turn still gets recall |
 | Later `prefetch()` | ~22 ms, off the hot path | Started at `on_turn_start`, consumed when the turn needs it |
 | `mem0_add` / `mem0_search` tool call | ~15–25 ms | Runs inline on the agent loop. Over half of it is reopening the leased store, which grows with the store — see [`lease_idle_release`](#lease_idle_release--paying-the-reopen-once-per-turn) |
-| `sync_turn` (extraction) | 0 ms on the loop | Background thread; the LLM call happens there |
+| `sync_turn` (extraction) | 0 ms on the loop | Queued to a single background worker; the LLM call happens there. Turns that arrive mid-extraction wait their turn rather than being dropped, up to a backlog of 8 |
 
 The build isn't free, it's just moved somewhere it overlaps with the user typing
 their first message. Worst case — a message submitted the instant the session
