@@ -409,7 +409,7 @@ it replaces.
 | `Hermes-routed memory LLM call failed …` | The routed provider rejected the call. The message includes the route; check `hermes model`. |
 | `… returned an empty response` | The model produced nothing (often a reasoning model that spent its budget). Raise `llm.max_tokens` or pin a different `llm.model`. |
 | `circuit breaker tripped after 5 consecutive failures` | Five failures in a row pause memory calls for 120s. Check the routed model and the vector store. |
-| Memory tools missing entirely | `memory.provider` not set to `mem0_hermes`, or the plugin isn't in `$HERMES_HOME/plugins/`. |
+| Memory tools missing entirely | `memory.provider` not set to `mem0_hermes`, or the plugin isn't in `$HERMES_HOME/plugins/`. If the provider withdrew instead, Hermes's "provider unavailable" warning now carries the reason — a `mem0_hermes.json` it couldn't read, or no `vector_store.provider`. |
 | Vector dimension errors after switching embedder | Handled automatically for local Qdrant (the collection is recreated); other stores need a manual reset. |
 
 ## Layout
@@ -426,6 +426,7 @@ _backend.py            # builds Mem0 Memory with the routed LLM injected
 _config.py             # config resolution, wizard schema, save_config
 scripts/dev_link.py    # link a checkout into $HERMES_HOME/plugins (dev)
 tests/                 # unittest suite (no pytest needed)
+.github/workflows/     # CI: the suite on Linux/macOS/Windows x Python 3.10-3.13
 ```
 
 Subdirectories are inert to Hermes: the memory loader only pre-registers
@@ -453,6 +454,14 @@ the suite also builds a real Mem0 `Memory` over a temporary Qdrant collection
 and asserts extraction actually flows through the routed adapter, and loads the
 plugin through Hermes's own `plugins.memory` loader. Those tests skip on a bare
 interpreter; the rest still run.
+
+CI runs the suite on every push and pull request across Linux, macOS and Windows
+on Python 3.10–3.13. It installs nothing, so `mem0ai` is absent there and the
+integration tests skip — **CI does not cover the Mem0 integration path**, which
+stays yours to run locally in a Hermes venv. What it does cover is every
+platform-conditional branch (`HERMES_HOME` resolution, the fastembed cache
+directory, console encoding, `dev_link.py`'s junction fallback), which is where
+this plugin's platform bugs have actually been.
 
 ## Contributing
 

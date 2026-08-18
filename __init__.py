@@ -2,8 +2,9 @@
 """mem0_hermes — Mem0 memory with fact extraction on your Hermes model.
 
 Drop-in alternative to the bundled ``mem0`` memory plugin. It uses the same
-Mem0 OSS engine (vector store, dedup, semantic search) and exposes the same
-four tools, but every LLM call Mem0 makes — fact extraction on each turn, the
+Mem0 OSS engine (vector store, dedup, semantic search) and exposes the bundled
+plugin's four tools unchanged (plus ``mem0_get_all``), but every LLM call Mem0
+makes — fact extraction on each turn, the
 add/update/delete decision pass — is routed through
 ``agent.auxiliary_client.call_llm`` instead of Mem0's built-in OpenAI client.
 No ``OPENAI_API_KEY`` is needed for memory generation; extraction runs on
