@@ -1,0 +1,25 @@
+tests/_bootstrap.py
+  s_6bd900efec2edd::t_263234d301ace7 23,63-70,72
+tests/test_provider.py
+  s_6bd900efec2edd::t_52042bd1fc97ef 376-411
+__init__.py
+  s_6bd900efec2edd::t_4ba840f423a62b 190,192,501-502,506,508,527,532,546,561,571-594
+README.md
+  s_6bd900efec2edd::t_f0a71c6e492c83 232
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "d8a1f9c4a29d4acb369d5b7b176c978645a7fea0",
+  "prompts": {},
+  "sessions": {
+    "s_6bd900efec2edd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57c3bc92-80ac-4b0c-85c0-f9204abd3a76",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
