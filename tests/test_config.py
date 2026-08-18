@@ -15,6 +15,21 @@ import _bootstrap  # noqa: F401 - sys.path bootstrap
 from mem0_hermes import _config
 
 
+# Cleared around each test so the ambient environment can't change what the
+# config resolves to. NO_INSTALL_ENV shares the MEM0_HERMES_ prefix but is not
+# config: it is the guard that stops a test from pip-installing into the
+# interpreter running the suite, so clearing it would disarm the very thing
+# _bootstrap.py arms. save_config() installs the selected embedder's packages,
+# and in a Hermes venv -- which is where CONTRIBUTING.md says to run this
+# suite -- tools.lazy_deps is importable and the install is real.
+_ENV_PREFIXES = ("MEM0_HERMES_", "MEM0_USER_ID", "MEM0_AGENT_ID")
+_ENV_KEEP = frozenset({_config.NO_INSTALL_ENV})
+
+
+def _is_managed_env(key):
+    return key.startswith(_ENV_PREFIXES) and key not in _ENV_KEEP
+
+
 class TempHomeTestCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -22,14 +37,14 @@ class TempHomeTestCase(unittest.TestCase):
         self._saved_env = {
             key: os.environ.pop(key)
             for key in list(os.environ)
-            if key.startswith(("MEM0_HERMES_", "MEM0_USER_ID", "MEM0_AGENT_ID"))
+            if _is_managed_env(key)
         }
         self.addCleanup(self._restore_env)
         self.addCleanup(self._tmp.cleanup)
 
     def _restore_env(self):
         for key in list(os.environ):
-            if key.startswith(("MEM0_HERMES_", "MEM0_USER_ID", "MEM0_AGENT_ID")):
+            if _is_managed_env(key):
                 del os.environ[key]
         os.environ.update(self._saved_env)
 
@@ -271,6 +286,20 @@ class WizardTests(TempHomeTestCase):
         saved = json.loads((self.home / _config.CONFIG_FILENAME).read_text(encoding="utf-8"))
         self.assertEqual(saved["user_id"], "alice")
         self.assertEqual(saved["llm"]["model"], "claude-opus-5")
+
+    def test_save_config_cannot_install_behind_the_guard(self):
+        # save_config() installs the chosen embedder's packages. The suite-wide
+        # guard has to survive setUp, or running the suite in a Hermes venv
+        # (where tools.lazy_deps is importable) pip-installs for real.
+        self.assertTrue(os.environ.get(_config.NO_INSTALL_ENV))
+        ok, message = _config.ensure_embedder_dependencies(
+            {"embedder": {"provider": "fastembed", "config": {}}}
+        )
+        if _config.embedder_pip_requirements(
+            {"embedder": {"provider": "fastembed", "config": {}}}
+        ):
+            self.assertFalse(ok)
+            self.assertIn(_config.NO_INSTALL_ENV, message)
 
     def test_schema_covers_wizard_keys(self):
         keys = {field["key"] for field in _config.config_schema(_config.default_config(self.home))}
