@@ -41,6 +41,7 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import re
 import threading
 import time
 from collections import deque
@@ -72,14 +73,19 @@ _SYNC_QUEUE_MAX = 8
 _SYNC_SHUTDOWN_WAIT_SECS = 5.0
 
 _CLIENT_ERROR_TYPES = ("MemoryNotFoundError", "ValidationError", "ValueError")
+# Anchored on word boundaries so it matches a status code and not the "404" that
+# happens to sit inside a byte count, a port, an id or a timestamp. Classifying
+# an infrastructure failure as user error is not cosmetic: it stops the failure
+# from counting toward the circuit breaker, so a vector store that is genuinely
+# down keeps being retried on every turn instead of backing off.
+_NOT_FOUND_RE = re.compile(r"\bnot found\b|\b404\b|\bvalid uuid\b")
 
 
 def _is_client_error(exc: Exception) -> bool:
     """True for user-caused errors (bad id, not found) — don't trip the breaker."""
     if type(exc).__name__ in _CLIENT_ERROR_TYPES:
         return True
-    text = str(exc).lower()
-    return "not found" in text or "404" in text or "valid uuid" in text
+    return _NOT_FOUND_RE.search(str(exc).lower()) is not None
 
 
 def _tool_error(message: str) -> str:

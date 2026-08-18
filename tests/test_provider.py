@@ -294,6 +294,37 @@ class BreakerTests(ProviderTestCase):
         self.assertFalse(provider._is_breaker_open())
 
 
+class ClientErrorTests(unittest.TestCase):
+    """Which failures count against the circuit breaker."""
+
+    def _is_client_error(self, message):
+        import mem0_hermes as plugin
+
+        return plugin._is_client_error(RuntimeError(message))
+
+    def test_user_errors_are_recognized(self):
+        for message in (
+            "Memory with id abc123 not found",
+            "HTTP 404: no such memory",
+            '"nope" is not a valid uuid',
+            "NOT FOUND",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(self._is_client_error(message))
+
+    def test_infrastructure_failures_are_not_excused_by_a_stray_404(self):
+        # Misreading these as user error keeps them off the breaker, so a
+        # vector store that is genuinely down is retried every turn forever.
+        for message in (
+            "connection reset after 404041 bytes",
+            "failed to connect to localhost:40404",
+            "upstream returned 4040 rows",
+            "timeout contacting the vector store",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(self._is_client_error(message))
+
+
 class TurnLifecycleTests(ProviderTestCase):
     def test_prefetch_injects_recalled_memories(self):
         backend = FakeBackend(results=[{"memory": "likes tea"}, {"memory": "lives in Berlin"}])
