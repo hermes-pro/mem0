@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 
 from _bootstrap import FakeResponse, FakeToolCall, RecordingCallLlm, install_call_llm
@@ -41,6 +42,39 @@ class CoerceJsonTests(unittest.TestCase):
 
     def test_handles_json_array(self):
         self.assertEqual(_hermes_llm.coerce_json('prefix [1, 2] suffix'), "[1, 2]")
+
+    def test_keeps_an_array_of_objects_intact(self):
+        # Slicing from the first "{" to the last "}" would return
+        # '{"a": 1}, {"b": 2}' — not JSON at all.
+        raw = '[{"a": 1}, {"b": 2}]'
+        self.assertEqual(_hermes_llm.coerce_json(raw), raw)
+        self.assertEqual(json.loads(_hermes_llm.coerce_json(raw)), [{"a": 1}, {"b": 2}])
+
+    def test_single_element_array_does_not_collapse_to_an_object(self):
+        # The dangerous case: preferring braces yields '{"text": "a"}', which
+        # parses cleanly and silently loses the surrounding list.
+        raw = 'here you go:\n[{"text": "a"}]'
+        self.assertEqual(json.loads(_hermes_llm.coerce_json(raw)), [{"text": "a"}])
+
+    def test_array_of_objects_inside_a_fence(self):
+        raw = '```json\n[{"text": "a"}, {"text": "b"}]\n```'
+        self.assertEqual(
+            json.loads(_hermes_llm.coerce_json(raw)), [{"text": "a"}, {"text": "b"}]
+        )
+
+    def test_prose_brackets_do_not_beat_the_real_payload(self):
+        # "[see above]" opens first but isn't the payload; the object is.
+        raw = 'Note [see above]: {"memory": []}'
+        self.assertEqual(_hermes_llm.coerce_json(raw), '{"memory": []}')
+
+    def test_object_containing_an_array_is_unchanged(self):
+        raw = '{"facts": ["a", "b"]}'
+        self.assertEqual(_hermes_llm.coerce_json(raw), raw)
+
+    def test_malformed_json_is_left_for_mem0_to_report(self):
+        # Neither candidate parses; the outermost span is returned as before
+        # rather than swallowing the response.
+        self.assertEqual(_hermes_llm.coerce_json('{"a": 1,}'), '{"a": 1,}')
 
     def test_passes_through_plain_text(self):
         self.assertEqual(_hermes_llm.coerce_json("no json here"), "no json here")

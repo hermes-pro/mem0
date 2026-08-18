@@ -15,6 +15,38 @@ import _bootstrap  # noqa: F401 - sys.path bootstrap
 from mem0_hermes import _config
 
 
+# Cleared around each test so the ambient environment can't change what the
+# config resolves to. NO_INSTALL_ENV shares the MEM0_HERMES_ prefix but is not
+# config: it is the guard that stops a test from pip-installing into the
+# interpreter running the suite, so clearing it would disarm the very thing
+# _bootstrap.py arms. save_config() installs the selected embedder's packages,
+# and in a Hermes venv -- which is where CONTRIBUTING.md says to run this
+# suite -- tools.lazy_deps is importable and the install is real.
+_ENV_PREFIXES = ("MEM0_HERMES_", "MEM0_USER_ID", "MEM0_AGENT_ID")
+_ENV_KEEP = frozenset({_config.NO_INSTALL_ENV})
+
+
+def _is_managed_env(key):
+    return key.startswith(_ENV_PREFIXES) and key not in _ENV_KEEP
+
+
+class Cp1252Log:
+    """A log sink that behaves like print() to a legacy Windows console.
+
+    cp1252 is still the default console encoding on Windows for Python <3.15
+    without UTF-8 mode, and encoding a character it lacks raises rather than
+    substituting. Simulating it here means the regression is caught on every
+    platform CI runs, not only the Windows legs.
+    """
+
+    def __init__(self):
+        self.lines = []
+
+    def __call__(self, message):
+        message.encode("cp1252")
+        self.lines.append(message)
+
+
 class TempHomeTestCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -22,14 +54,14 @@ class TempHomeTestCase(unittest.TestCase):
         self._saved_env = {
             key: os.environ.pop(key)
             for key in list(os.environ)
-            if key.startswith(("MEM0_HERMES_", "MEM0_USER_ID", "MEM0_AGENT_ID"))
+            if _is_managed_env(key)
         }
         self.addCleanup(self._restore_env)
         self.addCleanup(self._tmp.cleanup)
 
     def _restore_env(self):
         for key in list(os.environ):
-            if key.startswith(("MEM0_HERMES_", "MEM0_USER_ID", "MEM0_AGENT_ID")):
+            if _is_managed_env(key):
                 del os.environ[key]
         os.environ.update(self._saved_env)
 
@@ -128,6 +160,43 @@ class OverrideTests(TempHomeTestCase):
         self.write_config({"llm": {"model": "from-file"}})
         os.environ["MEM0_HERMES_LLM_MODEL"] = "from-env"
         self.assertEqual(_config.load_config(self.home)["llm"]["model"], "from-env")
+
+    def test_env_covers_every_llm_key(self):
+        os.environ.update(
+            {
+                "MEM0_HERMES_LLM_PROVIDER": "anthropic",
+                "MEM0_HERMES_LLM_MODEL": "claude-opus-5",
+                "MEM0_HERMES_LLM_BASE_URL": "https://example.invalid",
+                "MEM0_HERMES_LLM_API_KEY": "sk-env",
+                "MEM0_HERMES_LLM_TASK": "custom_task",
+                "MEM0_HERMES_JSON_MODE": "response_format",
+                "MEM0_HERMES_LLM_TEMPERATURE": "0.7",
+                "MEM0_HERMES_LLM_MAX_TOKENS": "512",
+                "MEM0_HERMES_LLM_TIMEOUT": "45",
+            }
+        )
+        llm = _config.load_config(self.home)["llm"]
+        self.assertEqual(llm["provider"], "anthropic")
+        self.assertEqual(llm["model"], "claude-opus-5")
+        self.assertEqual(llm["base_url"], "https://example.invalid")
+        self.assertEqual(llm["api_key"], "sk-env")
+        self.assertEqual(llm["task"], "custom_task")
+        self.assertEqual(llm["json_mode"], "response_format")
+        self.assertEqual(llm["temperature"], 0.7)
+        self.assertEqual(llm["max_tokens"], 512)
+        self.assertEqual(llm["timeout"], 45.0)
+
+    def test_numeric_env_overrides_are_typed_not_strings(self):
+        os.environ["MEM0_HERMES_LLM_MAX_TOKENS"] = "512"
+        llm = _config.load_config(self.home)["llm"]
+        self.assertIsInstance(llm["max_tokens"], int)
+
+    def test_malformed_numeric_env_falls_back_to_the_default(self):
+        os.environ["MEM0_HERMES_LLM_TEMPERATURE"] = "warm"
+        with self.assertLogs("mem0_hermes._config", level="WARNING") as logs:
+            llm = _config.load_config(self.home)["llm"]
+        self.assertEqual(llm["temperature"], 0.1)
+        self.assertIn("MEM0_HERMES_LLM_TEMPERATURE", "".join(logs.output))
 
     def test_inherits_embedder_and_vector_store_from_bundled_mem0(self):
         self.write_config(
@@ -234,6 +303,78 @@ class WizardTests(TempHomeTestCase):
         saved = json.loads((self.home / _config.CONFIG_FILENAME).read_text(encoding="utf-8"))
         self.assertEqual(saved["user_id"], "alice")
         self.assertEqual(saved["llm"]["model"], "claude-opus-5")
+
+    def test_save_config_cannot_install_behind_the_guard(self):
+        # save_config() installs the chosen embedder's packages. The suite-wide
+        # guard has to survive setUp, or running the suite in a Hermes venv
+        # (where tools.lazy_deps is importable) pip-installs for real.
+        self.assertTrue(os.environ.get(_config.NO_INSTALL_ENV))
+        ok, message = _config.ensure_embedder_dependencies(
+            {"embedder": {"provider": "fastembed", "config": {}}}
+        )
+        if _config.embedder_pip_requirements(
+            {"embedder": {"provider": "fastembed", "config": {}}}
+        ):
+            self.assertFalse(ok)
+            self.assertIn(_config.NO_INSTALL_ENV, message)
+
+    def test_every_offered_embedder_has_a_default_model(self):
+        # The wizard offers EMBEDDER_CHOICES and fills the model field from
+        # EMBEDDER_DEFAULT_MODEL; a provider missing from the map leaves the
+        # user staring at an empty prompt with nothing to suggest.
+        missing = [
+            provider
+            for provider in _config.EMBEDDER_CHOICES
+            if not _config.EMBEDDER_DEFAULT_MODEL.get(provider)
+        ]
+        self.assertEqual(missing, [])
+
+    def test_default_embedder_models_get_a_vector_width(self):
+        # Qdrant creates the collection at embedding_model_dims and Mem0's
+        # default for that is 1536, so a default model of some other width has
+        # to state it or every write fails on a dimension mismatch.
+        for provider, model in _config.EMBEDDER_DEFAULT_MODEL.items():
+            with self.subTest(provider=provider):
+                config = _config.load_config(self.home)
+                config["embedder"] = {"provider": provider, "config": {"model": model}}
+                _config._backfill_embedding_dims(config)
+                dims = config["embedder"]["config"].get("embedding_dims")
+                if provider == "lmstudio":
+                    # Intentionally unstated; see EMBEDDER_DEFAULT_MODEL.
+                    self.assertIsNone(dims)
+                else:
+                    self.assertIsInstance(dims, int)
+                    self.assertGreater(dims, 0)
+
+    def test_emit_degrades_the_status_marks_it_cannot_encode(self):
+        log = Cp1252Log()
+        _config._emit(log, f"  {_config._OK_MARK} installed fastembed")
+        _config._emit(log, f"  {_config._WARN_MARK} could not install")
+        self.assertEqual(
+            log.lines, ["  OK installed fastembed", "  ! could not install"]
+        )
+
+    def test_emit_passes_encodable_lines_through_unchanged(self):
+        log = Cp1252Log()
+        _config._emit(log, "  Installing fastembed embedder: fastembed>=0.3.1")
+        self.assertEqual(log.lines, ["  Installing fastembed embedder: fastembed>=0.3.1"])
+
+    def test_emit_survives_other_unencodable_characters(self):
+        log = Cp1252Log()
+        _config._emit(log, f"  {_config._OK_MARK} \u4e2d\u6587 model")
+        self.assertEqual(len(log.lines), 1)
+        self.assertIn("OK", log.lines[0])
+
+    def test_save_config_survives_a_cp1252_console(self):
+        # The wizard passes print. A UnicodeEncodeError here escapes
+        # save_config after the config was already written and the embedder
+        # install attempted, killing the wizard mid-step.
+        log = Cp1252Log()
+        _config.save_config({"embedder_provider": "fastembed"}, self.home, log=log)
+        saved = json.loads(
+            (self.home / _config.CONFIG_FILENAME).read_text(encoding="utf-8")
+        )
+        self.assertEqual(saved["embedder"]["provider"], "fastembed")
 
     def test_schema_covers_wizard_keys(self):
         keys = {field["key"] for field in _config.config_schema(_config.default_config(self.home))}

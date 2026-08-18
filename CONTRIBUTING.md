@@ -67,6 +67,14 @@ The suite is stdlib `unittest` — no pytest, no fixtures to install. It must st
 that way: it runs inside whatever interpreter Hermes was installed with, and we
 don't get to add dev dependencies there.
 
+CI (`.github/workflows/tests.yml`) runs it on every push and pull request across
+Linux, macOS and Windows on Python 3.10–3.13. There is no install step there, so
+`mem0ai` is absent and the integration tests skip themselves — CI covers the
+pure-logic paths on every platform, and the integration tests are yours to run
+locally in a Hermes venv. Windows is in the matrix on purpose: `HERMES_HOME`
+resolution, the fastembed cache directory and `dev_link.py`'s junction fallback
+all branch on the platform.
+
 ## Things to know before changing code
 
 A few constraints aren't obvious from reading a single file:

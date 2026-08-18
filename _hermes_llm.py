@@ -161,13 +161,40 @@ def _extract_tool_calls(response: Any) -> List[Dict[str, Any]]:
     return out
 
 
+def _delimited(text: str, opening: str, closing: str) -> str:
+    """The widest ``opening``-to-``closing`` span in ``text``, or ``""``."""
+    start = text.find(opening)
+    end = text.rfind(closing)
+    return text[start : end + 1] if start != -1 and end > start else ""
+
+
+def _is_json(text: str) -> bool:
+    try:
+        json.loads(text)
+    except Exception:
+        return False
+    return True
+
+
 def coerce_json(text: str) -> str:
-    """Reduce model output to the JSON object it contains.
+    """Reduce model output to the JSON value it contains.
 
     Mem0's prompts already demand bare JSON, but models reached through
     arbitrary providers wrap it in prose, code fences or ``<think>`` blocks.
     Mem0 tolerates fences on the extraction path only; doing it here makes
     every call site safe.
+
+    Both container shapes are considered, because either can be the payload:
+    Mem0's extraction and update passes return an object, while a model asked
+    for a list of facts often answers with a bare array. Neither delimiter can
+    be preferred unconditionally — slicing ``[{"a": 1}, {"b": 2}]`` from its
+    first ``{`` to its last ``}`` yields invalid JSON, and a one-element array
+    would collapse to a single object that parses but drops every fact after
+    the first. So the candidates are ranked by which container opens first (the
+    outermost one) and the first that actually parses wins, which also keeps
+    prose brackets — ``Note [see above]: {...}`` — from beating the real
+    payload. If neither parses, the outermost is returned unchanged and Mem0
+    reports the malformed response itself.
     """
     if not text:
         return text
@@ -175,15 +202,19 @@ def coerce_json(text: str) -> str:
     fenced = _FENCE_RE.search(cleaned)
     if fenced:
         cleaned = fenced.group(1).strip()
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end > start:
-        return cleaned[start : end + 1]
-    start = cleaned.find("[")
-    end = cleaned.rfind("]")
-    if start != -1 and end > start:
-        return cleaned[start : end + 1]
-    return cleaned
+
+    candidates = [
+        candidate
+        for candidate in (_delimited(cleaned, "{", "}"), _delimited(cleaned, "[", "]"))
+        if candidate
+    ]
+    if not candidates:
+        return cleaned
+    candidates.sort(key=lambda candidate: cleaned.find(candidate[0]))
+    for candidate in candidates:
+        if _is_json(candidate):
+            return candidate
+    return candidates[0]
 
 
 def _wants_json(response_format: Any) -> bool:

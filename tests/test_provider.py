@@ -6,9 +6,11 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import _bootstrap  # noqa: F401 - sys.path bootstrap
 
@@ -34,6 +36,7 @@ class FakeBackend:
         self.updates = []
         self.deletes = []
         self.searches = []
+        self.listings = []
         self.closed = False
 
     def _maybe_raise(self):
@@ -58,6 +61,12 @@ class FakeBackend:
         )
         return {}
 
+    def get_all(self, *, filters, limit=20, offset=0):
+        self.listings.append((filters, limit, offset))
+        self._maybe_raise()
+        window = self.results[offset : offset + limit]
+        return window, len(self.results) > offset + limit
+
     def update(self, memory_id, text):
         self._maybe_raise()
         self.updates.append((memory_id, text))
@@ -70,6 +79,20 @@ class FakeBackend:
 
     def close(self):
         self.closed = True
+
+
+class BlockingBackend(FakeBackend):
+    """Parks inside add() until released, so a write can be held in flight."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def add(self, messages, **kwargs):
+        self.entered.set()
+        self.release.wait(timeout=10)
+        return super().add(messages, **kwargs)
 
 
 class ProviderTestCase(unittest.TestCase):
@@ -113,6 +136,15 @@ class ProviderTestCase(unittest.TestCase):
     def _restore_backend_cls(self):
         _backend.HermesRoutedMem0Backend = self._saved_backend_cls
 
+    def wait_for_sync(self, provider, timeout=10.0):
+        """Block until the extraction worker has drained everything queued."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if provider.sync_idle():
+                return
+            time.sleep(0.01)
+        self.fail("queued turns were not extracted in time")
+
     def make_provider(self, backend=None, **init_kwargs):
         backend = backend if backend is not None else FakeBackend()
         _backend.HermesRoutedMem0Backend = lambda config: backend
@@ -141,6 +173,44 @@ class AvailabilityTests(ProviderTestCase):
         finally:
             if saved is not None:
                 os.environ["OPENAI_API_KEY"] = saved
+
+    def test_malformed_config_file_still_leaves_the_provider_available(self):
+        # _read_json skips a file it can't parse, so the defaults still resolve
+        # to a working local setup. Nothing to report.
+        (self.home / "mem0_hermes.json").write_text("{not json", encoding="utf-8")
+        provider = Mem0HermesMemoryProvider()
+        self.assertTrue(provider.is_available())
+        self.assertEqual(provider.unavailable_reason(), "")
+
+    def test_unavailable_reason_names_a_missing_vector_store(self):
+        provider = Mem0HermesMemoryProvider()
+        self.assertEqual(provider.unavailable_reason(), "")
+        with mock.patch(
+            "mem0_hermes._config.load_config", return_value={"vector_store": {}}
+        ):
+            self.assertFalse(provider.is_available())
+        reason = provider.unavailable_reason()
+        self.assertIn("vector_store", reason)
+        self.assertIn("hermes memory setup", reason)
+
+    def test_unavailable_reason_names_an_unreadable_config(self):
+        provider = Mem0HermesMemoryProvider()
+        with mock.patch(
+            "mem0_hermes._config.load_config", side_effect=OSError("permission denied")
+        ):
+            self.assertFalse(provider.is_available())
+        reason = provider.unavailable_reason()
+        self.assertIn("mem0_hermes.json", reason)
+        self.assertIn("permission denied", reason)
+
+    def test_unavailable_reason_clears_once_available(self):
+        provider = Mem0HermesMemoryProvider()
+        with mock.patch(
+            "mem0_hermes._config.load_config", return_value={"vector_store": {}}
+        ):
+            self.assertFalse(provider.is_available())
+        self.assertTrue(provider.is_available())
+        self.assertEqual(provider.unavailable_reason(), "")
 
     def test_missing_embedder_key_reported_through_tool_errors(self):
         (self.home / "mem0_hermes.json").write_text(
@@ -193,6 +263,69 @@ class ToolTests(ProviderTestCase):
         self.assertEqual(payload["count"], 1)
         self.assertEqual(payload["results"][0]["memory"], "likes tea")
         self.assertEqual(backend.searches[0][1], {"user_id": "tester"})
+
+    def test_get_all_lists_memories_with_ids(self):
+        backend = FakeBackend(
+            results=[
+                {"id": "1", "memory": "likes tea"},
+                {"id": "2", "memory": "lives in Berlin"},
+            ]
+        )
+        provider, _ = self.make_provider(backend)
+        payload = json.loads(provider.handle_tool_call("mem0_get_all", {}))
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["offset"], 0)
+        self.assertFalse(payload["has_more"])
+        self.assertEqual(payload["results"][0]["id"], "1")
+        self.assertEqual(backend.listings[0][0], {"user_id": "tester"})
+
+    def test_get_all_pages_and_reports_more(self):
+        backend = FakeBackend(
+            results=[{"id": str(n), "memory": f"fact {n}"} for n in range(5)]
+        )
+        provider, _ = self.make_provider(backend)
+        first = json.loads(
+            provider.handle_tool_call("mem0_get_all", {"limit": 2})
+        )
+        self.assertTrue(first["has_more"])
+        self.assertEqual([r["id"] for r in first["results"]], ["0", "1"])
+
+        second = json.loads(
+            provider.handle_tool_call("mem0_get_all", {"limit": 2, "offset": 2})
+        )
+        self.assertTrue(second["has_more"])
+        self.assertEqual([r["id"] for r in second["results"]], ["2", "3"])
+
+        last = json.loads(
+            provider.handle_tool_call("mem0_get_all", {"limit": 2, "offset": 4})
+        )
+        self.assertFalse(last["has_more"])
+        self.assertEqual([r["id"] for r in last["results"]], ["4"])
+
+    def test_get_all_clamps_limit_and_offset(self):
+        provider, backend = self.make_provider()
+        provider.handle_tool_call("mem0_get_all", {"limit": 900, "offset": -5})
+        self.assertEqual(backend.listings[0][1], 100)
+        self.assertEqual(backend.listings[0][2], 0)
+
+    def test_get_all_on_an_empty_store(self):
+        provider, _ = self.make_provider(FakeBackend(results=[]))
+        payload = json.loads(provider.handle_tool_call("mem0_get_all", {}))
+        self.assertIn("No memories stored yet", payload["result"])
+
+    def test_get_all_past_the_end_says_so(self):
+        backend = FakeBackend(results=[{"id": "1", "memory": "likes tea"}])
+        provider, _ = self.make_provider(backend)
+        payload = json.loads(
+            provider.handle_tool_call("mem0_get_all", {"offset": 50})
+        )
+        self.assertIn("past that offset", payload["result"])
+
+    def test_get_all_is_exposed_as_a_tool(self):
+        provider, _ = self.make_provider()
+        names = {schema["name"] for schema in provider.get_tool_schemas()}
+        self.assertIn("mem0_get_all", names)
+        self.assertIn("mem0_get_all", provider.system_prompt_block())
 
     def test_search_top_k_is_clamped(self):
         provider, backend = self.make_provider()
@@ -269,6 +402,37 @@ class BreakerTests(ProviderTestCase):
         self.assertFalse(provider._is_breaker_open())
 
 
+class ClientErrorTests(unittest.TestCase):
+    """Which failures count against the circuit breaker."""
+
+    def _is_client_error(self, message):
+        import mem0_hermes as plugin
+
+        return plugin._is_client_error(RuntimeError(message))
+
+    def test_user_errors_are_recognized(self):
+        for message in (
+            "Memory with id abc123 not found",
+            "HTTP 404: no such memory",
+            '"nope" is not a valid uuid',
+            "NOT FOUND",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(self._is_client_error(message))
+
+    def test_infrastructure_failures_are_not_excused_by_a_stray_404(self):
+        # Misreading these as user error keeps them off the breaker, so a
+        # vector store that is genuinely down is retried every turn forever.
+        for message in (
+            "connection reset after 404041 bytes",
+            "failed to connect to localhost:40404",
+            "upstream returned 4040 rows",
+            "timeout contacting the vector store",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(self._is_client_error(message))
+
+
 class TurnLifecycleTests(ProviderTestCase):
     def test_prefetch_injects_recalled_memories(self):
         backend = FakeBackend(results=[{"memory": "likes tea"}, {"memory": "lives in Berlin"}])
@@ -278,6 +442,42 @@ class TurnLifecycleTests(ProviderTestCase):
         self.assertIn("## Mem0 Memory", block)
         self.assertIn("- likes tea", block)
         self.assertIn("- lives in Berlin", block)
+
+    def test_recall_status_counts_what_was_injected(self):
+        backend = FakeBackend(
+            results=[{"memory": "likes tea"}, {"memory": "lives in Berlin"}]
+        )
+        provider, _ = self.make_provider(backend)
+        provider.on_turn_start(1, "tea?")
+        provider.prefetch("tea?")
+        status = provider.recall_status()
+        self.assertIsNotNone(status)
+        self.assertEqual(status.count, 2)
+        self.assertEqual(status.provider_label, "Mem0")
+
+    def test_recall_status_is_none_when_nothing_was_recalled(self):
+        provider, _ = self.make_provider(FakeBackend(results=[]))
+        provider.on_turn_start(1, "tea?")
+        provider.prefetch("tea?")
+        self.assertIsNone(provider.recall_status())
+
+    def test_recall_status_never_reports_a_stale_count(self):
+        # The ABC is explicit that a stale count is a bug: the indicator would
+        # tell the user memories were injected on a turn where none were.
+        backend = FakeBackend(results=[{"memory": "likes tea"}])
+        provider, _ = self.make_provider(backend)
+        provider.on_turn_start(1, "tea?")
+        provider.prefetch("tea?")
+        self.assertEqual(provider.recall_status().count, 1)
+
+        backend.results = []
+        provider.on_turn_start(2, "unrelated?")
+        provider.prefetch("unrelated?")
+        self.assertIsNone(provider.recall_status())
+
+    def test_recall_status_is_none_before_any_prefetch(self):
+        provider, _ = self.make_provider()
+        self.assertIsNone(provider.recall_status())
 
     def test_prefetch_result_is_consumed_once(self):
         backend = FakeBackend(results=[{"memory": "likes tea"}])
@@ -290,6 +490,40 @@ class TurnLifecycleTests(ProviderTestCase):
         provider.prefetch("tea?")
         self.assertGreater(len(backend.searches), before)
 
+    def test_prefetch_budget_is_spent_once_when_the_backend_is_slow(self):
+        # The worker gives up waiting for a backend that is still building. It
+        # must still publish that "nothing to inject" answer, or the next
+        # prefetch() sees a finished-but-not-done worker, starts a second one,
+        # and blocks the hot path for the whole budget a second time.
+        import mem0_hermes as plugin
+
+        provider = Mem0HermesMemoryProvider()
+        self.addCleanup(provider.shutdown)
+        provider._init_started = True  # initialize() ran; the build is in flight
+
+        with mock.patch.object(plugin, "_PREFETCH_WAIT_SECS", 0.2):
+            provider.on_turn_start(1, "tea?")
+            provider._prefetch_thread.join(timeout=5)
+            self.assertTrue(provider._prefetch_done)
+
+            started = time.monotonic()
+            self.assertEqual(provider.prefetch("tea?"), "")
+            elapsed = time.monotonic() - started
+
+        self.assertLess(
+            elapsed, 0.2, "prefetch restarted the worker and waited a second time"
+        )
+
+    def test_prefetch_retries_on_a_later_turn(self):
+        # Publishing the give-up must not latch: once the backend is up, the
+        # next turn prefetches normally.
+        backend = FakeBackend(results=[{"memory": "likes tea"}])
+        provider, _ = self.make_provider(backend)
+        provider.on_turn_start(1, "tea?")
+        self.assertIn("likes tea", provider.prefetch("tea?"))
+        provider.on_turn_start(2, "coffee?")
+        self.assertIn("likes tea", provider.prefetch("coffee?"))
+
     def test_prefetch_failure_is_silent_but_counted(self):
         backend = FakeBackend(error=RuntimeError("vector store down"))
         provider, _ = self.make_provider(backend)
@@ -300,11 +534,85 @@ class TurnLifecycleTests(ProviderTestCase):
     def test_sync_turn_sends_both_roles_with_inference(self):
         provider, backend = self.make_provider()
         provider.sync_turn("I drink dark roast", "Noted.")
-        provider._sync_thread.join(timeout=5)
+        self.wait_for_sync(provider)
         self.assertEqual(len(backend.adds), 1)
         call = backend.adds[0]
         self.assertTrue(call["infer"])  # extraction runs on the Hermes model
         self.assertEqual([m["role"] for m in call["messages"]], ["user", "assistant"])
+
+    def test_sync_turn_does_not_block_the_caller(self):
+        # The previous implementation joined the running sync thread for up to
+        # 5s on the caller's thread and then discarded the turn.
+        backend = BlockingBackend()
+        provider, _ = self.make_provider(backend)
+        provider.sync_turn("first", "ok")
+        self.assertTrue(backend.entered.wait(timeout=5))
+
+        started = time.monotonic()
+        provider.sync_turn("second", "ok")
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.5)
+
+        backend.release.set()
+        self.wait_for_sync(provider)
+        # ...and the turn that arrived mid-extraction was written, not dropped.
+        self.assertEqual(len(backend.adds), 2)
+        self.assertEqual(
+            [call["messages"][0]["content"] for call in backend.adds],
+            ["first", "second"],
+        )
+
+    def test_queue_drops_the_oldest_turn_when_extraction_falls_behind(self):
+        import mem0_hermes as plugin
+
+        backend = BlockingBackend()
+        provider, _ = self.make_provider(backend)
+        provider.sync_turn("in flight", "ok")
+        self.assertTrue(backend.entered.wait(timeout=5))
+
+        overflow = 2
+        for index in range(plugin._SYNC_QUEUE_MAX + overflow):
+            provider.sync_turn(f"turn {index}", "ok")
+        backend.release.set()
+        self.wait_for_sync(provider)
+
+        written = [call["messages"][0]["content"] for call in backend.adds]
+        self.assertEqual(provider._sync_dropped, overflow)
+        self.assertEqual(written[0], "in flight")
+        # The oldest queued turns go; the newest are kept and stay in order.
+        self.assertNotIn("turn 0", written)
+        self.assertNotIn("turn 1", written)
+        self.assertEqual(written[1:], [
+            f"turn {index}"
+            for index in range(overflow, plugin._SYNC_QUEUE_MAX + overflow)
+        ])
+
+    def test_sync_turn_ignores_the_full_conversation_history(self):
+        # MemoryProvider passes the entire conversation as of this turn --
+        # earlier turns, assistant tool calls, tool results. Extracting from it
+        # would re-mine the whole history every turn and read tool output as
+        # facts about the user; only the turn's own content is written.
+        provider, backend = self.make_provider()
+        provider.sync_turn(
+            "I drink dark roast",
+            "Noted.",
+            messages=[
+                {"role": "user", "content": "an old turn"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
+                {"role": "tool", "content": "/etc/passwd contents"},
+                {"role": "user", "content": "I drink dark roast"},
+                {"role": "assistant", "content": "Noted."},
+            ],
+        )
+        self.wait_for_sync(provider)
+        self.assertEqual(len(backend.adds), 1)
+        self.assertEqual(
+            backend.adds[0]["messages"],
+            [
+                {"role": "user", "content": "I drink dark roast"},
+                {"role": "assistant", "content": "Noted."},
+            ],
+        )
 
     def test_sync_turn_skips_empty_turns(self):
         provider, backend = self.make_provider()
@@ -331,6 +639,25 @@ class TurnLifecycleTests(ProviderTestCase):
         provider, backend = self.make_provider()
         provider.shutdown()
         self.assertTrue(backend.closed)
+
+    def test_reinitialize_does_not_leak_a_backend_reference(self):
+        # acquire_backend refcounts one shared owner per storage path, so a
+        # second initialize() hands back the same object with the count bumped.
+        # If the first reference is never dropped the count never reaches zero,
+        # shutdown() closes nothing, and the embedded Qdrant directory stays
+        # locked against every other Hermes process until the interpreter exits.
+        provider, backend = self.make_provider()
+        key = _backend._share_key(provider._config)
+        self.assertIs(_backend._OWNERS.get(key), backend)
+
+        provider.initialize("session-2", hermes_home=str(self.home))
+        provider._backend_thread.join(timeout=10)
+        self.assertIs(provider._backend, backend)
+        self.assertEqual(backend._refcount, 1)
+
+        provider.shutdown()
+        self.assertTrue(backend.closed)
+        self.assertNotIn(key, _backend._OWNERS)
 
 
 BUILD_SECONDS = 0.6
@@ -402,7 +729,7 @@ class BackgroundInitTests(ProviderTestCase):
     def test_sync_turn_waits_for_the_backend(self):
         provider, backend, _elapsed = self._slow_provider()
         provider.sync_turn("I drink dark roast", "Noted.")
-        provider._sync_thread.join(timeout=10)
+        self.wait_for_sync(provider)
         self.assertEqual(len(backend.adds), 1)
 
     def test_system_prompt_never_blocks(self):

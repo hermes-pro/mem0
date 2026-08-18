@@ -20,12 +20,20 @@ Activate with ``memory.provider: mem0_hermes`` in ``config.yaml``, or by running
 
 Lifecycle behavior (prefetch-with-short-wait, background turn sync, and the
 consecutive-failure circuit breaker) follows the bundled ``plugins/memory/mem0``
-provider so the two behave identically from the agent's point of view. One
-addition: the backend is built on a background thread, because ``initialize()``
-runs inline on Hermes's session-startup path and building it costs ~1.5 s —
-mostly importing ``qdrant_client`` and ``fastembed``, not the embedding model,
-which is ~200 ms of that. Consumers wait for readiness where it matters instead — prefetch inside
-its existing budget, tool calls and turn sync in their own threads.
+provider so the two behave identically from the agent's point of view, with two
+departures:
+
+* The backend is built on a background thread, because ``initialize()`` runs
+  inline on Hermes's session-startup path and building it costs ~1.5 s — mostly
+  importing ``qdrant_client`` and ``fastembed``, not the embedding model, which
+  is ~200 ms of that. Consumers wait for readiness where it matters instead:
+  prefetch inside its existing budget, tool calls and turn sync in their own
+  threads.
+* Turn sync is queued to one long-lived worker rather than started per turn.
+  Extraction is an LLM call, so a burst of short turns outruns it; the bundled
+  provider discards the turns that arrive meanwhile, which loses memories from
+  exactly the fast back-and-forth where they matter. Queued turns are extracted
+  in order and only dropped once the backlog exceeds ``_SYNC_QUEUE_MAX``.
 """
 
 from __future__ import annotations
@@ -33,9 +41,11 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import re
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from agent.memory_provider import MemoryProvider
 
@@ -53,15 +63,29 @@ _PREFETCH_WAIT_SECS = 3
 # memory is unavailable.
 _BACKEND_WAIT_SECS = 30
 
+# Turns waiting to be extracted. Extraction is an LLM call, so a burst of short
+# turns can outrun it; queueing lets them catch up instead of being thrown away.
+# Bounded because the alternative to dropping under sustained overload is
+# unbounded memory growth and an ever-staler backlog — and the oldest turn is
+# the least useful one to keep.
+_SYNC_QUEUE_MAX = 8
+# How long shutdown waits for the worker to finish the write in flight.
+_SYNC_SHUTDOWN_WAIT_SECS = 5.0
+
 _CLIENT_ERROR_TYPES = ("MemoryNotFoundError", "ValidationError", "ValueError")
+# Anchored on word boundaries so it matches a status code and not the "404" that
+# happens to sit inside a byte count, a port, an id or a timestamp. Classifying
+# an infrastructure failure as user error is not cosmetic: it stops the failure
+# from counting toward the circuit breaker, so a vector store that is genuinely
+# down keeps being retried on every turn instead of backing off.
+_NOT_FOUND_RE = re.compile(r"\bnot found\b|\b404\b|\bvalid uuid\b")
 
 
 def _is_client_error(exc: Exception) -> bool:
     """True for user-caused errors (bad id, not found) — don't trip the breaker."""
     if type(exc).__name__ in _CLIENT_ERROR_TYPES:
         return True
-    text = str(exc).lower()
-    return "not found" in text or "404" in text or "valid uuid" in text
+    return _NOT_FOUND_RE.search(str(exc).lower()) is not None
 
 
 def _tool_error(message: str) -> str:
@@ -108,6 +132,34 @@ ADD_SCHEMA = {
             "content": {"type": "string", "description": "The fact to store."},
         },
         "required": ["content"],
+    },
+}
+
+GET_ALL_SCHEMA = {
+    "name": "mem0_get_all",
+    "description": (
+        "List stored memories in bulk, without a search query. Use when the "
+        "user asks what you remember about them, or wants to review, audit or "
+        "clean up their memories — mem0_search only surfaces what matches a "
+        "query, so it is the wrong tool for 'show me everything'. Returns a "
+        "page of memories with their IDs, usable with mem0_update and "
+        "mem0_delete. Order is the store's own and is not chronological."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {
+                "type": "integer",
+                "description": "Memories per page (default: 20, max: 100).",
+            },
+            "offset": {
+                "type": "integer",
+                "description": (
+                    "How many to skip; pass the previous call's offset + limit "
+                    "to get the next page while has_more is true."
+                ),
+            },
+        },
     },
 }
 
@@ -163,14 +215,21 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         self._prefetch_thread: Optional[threading.Thread] = None
         self._prefetch_query = ""
         self._prefetch_result = ""
+        self._prefetch_count = 0
         self._prefetch_done = False
+        self._last_recall_count = 0
         self._prefetch_lock = threading.Lock()
         self._sync_thread: Optional[threading.Thread] = None
-        self._sync_lock = threading.Lock()
+        self._sync_cond = threading.Condition()
+        self._sync_queue: Deque[Tuple[str, str]] = deque()
+        self._sync_busy = False
+        self._sync_stopping = False
+        self._sync_dropped = 0
         self._breaker_lock = threading.Lock()
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
         self._atexit_registered = False
+        self._unavailable_reason = ""
 
     # -- Identity / availability --------------------------------------------
 
@@ -190,12 +249,22 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         """
         from . import _config as cfgmod
 
+        self._unavailable_reason = ""
         try:
             config = cfgmod.load_config()
         except Exception as exc:
+            self._unavailable_reason = (
+                f"{cfgmod.CONFIG_FILENAME} in {cfgmod.hermes_home()} could not "
+                f"be read ({exc}). Fix the JSON, or delete it and run "
+                "`hermes memory setup`."
+            )
             logger.warning("mem0_hermes: config could not be read: %s", exc)
             return False
         if not (config.get("vector_store") or {}).get("provider"):
+            self._unavailable_reason = (
+                "no vector_store.provider is configured; run "
+                "`hermes memory setup` to pick one."
+            )
             logger.warning("mem0_hermes: no vector_store configured")
             return False
         missing = cfgmod.embedder_key_missing(config)
@@ -207,6 +276,16 @@ class Mem0HermesMemoryProvider(MemoryProvider):
                 (config.get("embedder") or {}).get("provider"), missing,
             )
         return True
+
+    def unavailable_reason(self) -> str:
+        """Why :meth:`is_available` said no, for the caller's warning.
+
+        An unavailable provider is never initialized, so nothing this plugin
+        would log from ``initialize()`` is reachable — without this the user
+        sees "provider unavailable" and has to guess between a malformed config
+        file and an unconfigured vector store.
+        """
+        return self._unavailable_reason
 
     # -- Setup --------------------------------------------------------------
 
@@ -263,6 +342,10 @@ class Mem0HermesMemoryProvider(MemoryProvider):
 
         self._backend_ready.clear()
         self._init_started = True
+        with self._sync_cond:
+            # A provider reused after shutdown() (the gateway rebuilds one on
+            # provider error) must accept turns again.
+            self._sync_stopping = False
         if background:
             # Building the backend costs ~1.5 s — dominated by importing
             # qdrant_client (~1.25 s, pydantic model construction) and fastembed
@@ -284,8 +367,20 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         try:
             backend = self._create_backend()
         finally:
-            self._backend = backend
+            previous, self._backend = self._backend, backend
             self._backend_ready.set()
+        # A second initialize() (a gateway starting another session, a rebuild
+        # after a provider error) takes a second reference from
+        # acquire_backend's registry — usually to the very same shared object,
+        # since sharing is keyed on the storage path. Dropping the old
+        # reference here is what keeps this provider holding exactly one:
+        # without it the refcount never reaches zero, shutdown() closes
+        # nothing, and the embedded Qdrant directory stays locked against every
+        # other Hermes process until the interpreter exits. Released after the
+        # swap, so nothing waiting on _backend_ready can observe a released
+        # backend.
+        if previous is not None:
+            self._release(previous)
         if backend is not None and not self._atexit_registered:
             atexit.register(self._shutdown_backend)
             self._atexit_registered = True
@@ -331,10 +426,8 @@ class Mem0HermesMemoryProvider(MemoryProvider):
             logger.error("mem0_hermes: backend failed to initialize: %s", exc)
             return None
 
-    def _shutdown_backend(self) -> None:
-        backend, self._backend = self._backend, None
-        if backend is None:
-            return
+    def _release(self, backend) -> None:
+        """Drop one reference to ``backend``; the registry closes it at zero."""
         try:
             from . import _backend as backend_mod
 
@@ -345,17 +438,24 @@ class Mem0HermesMemoryProvider(MemoryProvider):
             except Exception:
                 pass
 
+    def _shutdown_backend(self) -> None:
+        backend, self._backend = self._backend, None
+        if backend is None:
+            return
+        self._release(backend)
+
     def shutdown(self) -> None:
         # The builder first: closing a store that is still being constructed
         # would race the construction, and the workers below may be waiting on it.
         if self._backend_thread is not None and self._backend_thread.is_alive():
             self._backend_thread.join(timeout=_BACKEND_WAIT_SECS)
-        for thread in (self._prefetch_thread, self._sync_thread):
-            if thread is not None and thread.is_alive():
-                thread.join(timeout=5.0)
-        # Unblocks anything still waiting: they see no backend and give up
-        # instead of sitting out their full timeout during shutdown.
+        # Before joining the workers, not after: a worker parked in
+        # _await_backend would otherwise sit out its full timeout while
+        # shutdown waits on it. Set, they see no backend and give up.
         self._backend_ready.set()
+        self._stop_sync_worker()
+        if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+            self._prefetch_thread.join(timeout=5.0)
         self._shutdown_backend()
 
     # -- Circuit breaker ----------------------------------------------------
@@ -419,19 +519,22 @@ class Mem0HermesMemoryProvider(MemoryProvider):
             "For multi-part or multi-hop questions, run several searches with "
             "different wording and follow up on what the first results surface; "
             "one search is rarely enough.\n"
-            "Tools: mem0_search to find memories, mem0_add to store facts, "
-            "mem0_update and mem0_delete to manage them by ID."
+            "Tools: mem0_search to find memories, mem0_get_all to list them "
+            "when the user wants to review everything you remember, mem0_add "
+            "to store facts, mem0_update and mem0_delete to manage them by ID."
         )
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._start_prefetch(message)
 
-    def _consume_prefetch_result(self, query: str) -> Optional[str]:
+    def _consume_prefetch_result(self, query: str) -> Optional[Tuple[str, int]]:
+        """The prefetched block and how many memories it holds, once only."""
         with self._prefetch_lock:
             if self._prefetch_query != query or not self._prefetch_done:
                 return None
-            result = self._prefetch_result
+            result = (self._prefetch_result, self._prefetch_count)
             self._prefetch_result = ""
+            self._prefetch_count = 0
             self._prefetch_done = False
             return result
 
@@ -450,28 +553,42 @@ class Mem0HermesMemoryProvider(MemoryProvider):
                     return
             self._prefetch_query = query
             self._prefetch_result = ""
+            self._prefetch_count = 0
             self._prefetch_done = False
 
         def _run() -> None:
             body = ""
+            count = 0
             try:
                 backend = self._await_backend(_PREFETCH_WAIT_SECS)
-                if backend is None:
-                    return
-                results = backend.search(
-                    query, filters=self._read_filters(), top_k=10, rerank=False
-                )
-                lines = [r.get("memory", "") for r in (results or []) if r.get("memory")]
-                if lines:
-                    body = "## Mem0 Memory\n" + "\n".join(f"- {line}" for line in lines)
-                self._record_success()
+                if backend is not None:
+                    results = backend.search(
+                        query, filters=self._read_filters(), top_k=10, rerank=False
+                    )
+                    lines = [
+                        r.get("memory", "") for r in (results or []) if r.get("memory")
+                    ]
+                    if lines:
+                        body = "## Mem0 Memory\n" + "\n".join(
+                            f"- {line}" for line in lines
+                        )
+                        count = len(lines)
+                    self._record_success()
             except Exception as exc:
                 self._record_failure()
                 logger.debug("mem0_hermes: prefetch failed: %s", exc)
-            with self._prefetch_lock:
-                if self._prefetch_query == query:
-                    self._prefetch_result = body
-                    self._prefetch_done = True
+            finally:
+                # Unconditional, including the backend-not-ready path: an empty
+                # body IS the answer ("nothing to inject, fall back to
+                # mem0_search"). Leaving the flag unset instead makes the next
+                # prefetch() see a finished-but-not-done worker and start a
+                # second one, spending _PREFETCH_WAIT_SECS all over again on
+                # the hot path.
+                with self._prefetch_lock:
+                    if self._prefetch_query == query:
+                        self._prefetch_result = body
+                        self._prefetch_count = count
+                        self._prefetch_done = True
 
         thread = threading.Thread(target=_run, daemon=True, name="mem0-hermes-prefetch")
         with self._prefetch_lock:
@@ -480,15 +597,30 @@ class Mem0HermesMemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         cached = self._consume_prefetch_result(query)
-        if cached is not None:
-            return cached
-        self._start_prefetch(query)
-        with self._prefetch_lock:
-            thread = self._prefetch_thread if self._prefetch_query == query else None
-        if thread is not None:
-            thread.join(timeout=_PREFETCH_WAIT_SECS)
-        cached = self._consume_prefetch_result(query)
-        return cached if cached is not None else ""
+        if cached is None:
+            self._start_prefetch(query)
+            with self._prefetch_lock:
+                thread = self._prefetch_thread if self._prefetch_query == query else None
+            if thread is not None:
+                thread.join(timeout=_PREFETCH_WAIT_SECS)
+            cached = self._consume_prefetch_result(query)
+        body, count = cached if cached is not None else ("", 0)
+        # Set on every path, including the empty ones: recall_status() must
+        # describe THIS turn, and a count left over from an earlier turn would
+        # show the user an indicator for memories that were not injected.
+        self._last_recall_count = count
+        return body
+
+    def recall_status(self):
+        """What the last :meth:`prefetch` injected, for the agent's indicator."""
+        if not self._last_recall_count:
+            return None
+        try:
+            from agent.memory_provider import RecallStatus
+        except ImportError:
+            # Older Hermes without the indicator: nothing to report to.
+            return None
+        return RecallStatus(provider_label="Mem0", count=self._last_recall_count)
 
     # -- Write --------------------------------------------------------------
 
@@ -500,7 +632,19 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """Hand the turn to Mem0 for extraction on the Hermes model (async)."""
+        """Hand the turn to Mem0 for extraction on the Hermes model (async).
+
+        ``messages`` is accepted to satisfy the ``MemoryProvider`` contract and
+        deliberately ignored. It is the whole OpenAI-style conversation as of
+        this turn — every earlier turn, plus assistant tool calls and tool
+        results — not the turn alone. Passing it to ``Memory.add`` would
+        re-extract the entire history on every turn (quadratic model spend, and
+        Mem0's dedup pass asked to re-decide every prior fact each time), and
+        would mine tool output for "user facts": a file listing or an API
+        response read as something the user said about themselves. The
+        user/assistant pair is the turn's actual new content, so that is what
+        gets extracted. The ABC explicitly allows ignoring it.
+        """
         if self._is_breaker_open():
             return
         if not (user_content or assistant_content):
@@ -514,42 +658,106 @@ class Mem0HermesMemoryProvider(MemoryProvider):
         if self._backend is None and self._backend_ready.is_set():
             return  # the build finished and failed; nothing to write to
 
-        def _sync() -> None:
-            backend = self._await_backend(_BACKEND_WAIT_SECS)
-            if backend is None:
+        with self._sync_cond:
+            if self._sync_stopping:
                 return
-            try:
-                backend.add(
-                    [
-                        {"role": "user", "content": user_content},
-                        {"role": "assistant", "content": assistant_content},
-                    ],
-                    user_id=self._user_id,
-                    agent_id=self._agent_id,
-                    infer=True,
-                    metadata=self._write_metadata(),
+            if len(self._sync_queue) >= _SYNC_QUEUE_MAX:
+                # Oldest first: it is the least useful turn to keep, and the
+                # backlog is already staler than whatever is arriving now.
+                self._sync_queue.popleft()
+                self._sync_dropped += 1
+                logger.warning(
+                    "mem0_hermes: extraction is %d turns behind; dropped the "
+                    "oldest queued turn (%d dropped this session). The routed "
+                    "model (%s) is slower than the conversation.",
+                    _SYNC_QUEUE_MAX, self._sync_dropped, self._routing_label(),
                 )
-                self._record_success()
-            except Exception as exc:
-                self._record_failure()
-                logger.warning("mem0_hermes: turn sync failed: %s", exc)
+            self._sync_queue.append((user_content, assistant_content))
+            self._ensure_sync_worker()
+            self._sync_cond.notify()
 
-        with self._sync_lock:
-            if self._sync_thread is not None and self._sync_thread.is_alive():
-                self._sync_thread.join(timeout=5.0)
-            # Still running: skip rather than risk double ingestion of a turn.
-            if self._sync_thread is not None and self._sync_thread.is_alive():
-                logger.debug("mem0_hermes: previous sync still running; skipping turn")
-                return
-            self._sync_thread = threading.Thread(
-                target=_sync, daemon=True, name="mem0-hermes-sync"
+    def _ensure_sync_worker(self) -> None:
+        """Start the extraction worker if it isn't running. Call under the lock."""
+        if self._sync_thread is not None and self._sync_thread.is_alive():
+            return
+        self._sync_thread = threading.Thread(
+            target=self._sync_worker, daemon=True, name="mem0-hermes-sync"
+        )
+        self._sync_thread.start()
+
+    def _sync_worker(self) -> None:
+        """Drain queued turns one at a time, in order.
+
+        One worker rather than one thread per turn: Mem0's add is a
+        read-decide-write cycle over a shared store, so overlapping extractions
+        can each work from a snapshot taken before the other's write and
+        duplicate a fact.
+        """
+        while True:
+            with self._sync_cond:
+                while not self._sync_queue and not self._sync_stopping:
+                    self._sync_cond.wait()
+                if self._sync_stopping:
+                    return
+                turn = self._sync_queue.popleft()
+                self._sync_busy = True
+            try:
+                self._write_turn(turn)
+            except Exception as exc:  # pragma: no cover - _write_turn catches
+                logger.warning("mem0_hermes: sync worker error: %s", exc)
+            finally:
+                with self._sync_cond:
+                    self._sync_busy = False
+                    self._sync_cond.notify_all()
+
+    def _write_turn(self, turn: Tuple[str, str]) -> None:
+        user_content, assistant_content = turn
+        backend = self._await_backend(_BACKEND_WAIT_SECS)
+        if backend is None:
+            return
+        try:
+            backend.add(
+                [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": assistant_content},
+                ],
+                user_id=self._user_id,
+                agent_id=self._agent_id,
+                infer=True,
+                metadata=self._write_metadata(),
             )
-            self._sync_thread.start()
+            self._record_success()
+        except Exception as exc:
+            self._record_failure()
+            logger.warning("mem0_hermes: turn sync failed: %s", exc)
+
+    def _stop_sync_worker(self) -> None:
+        with self._sync_cond:
+            self._sync_stopping = True
+            thread = self._sync_thread
+            self._sync_cond.notify_all()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=_SYNC_SHUTDOWN_WAIT_SECS)
+        with self._sync_cond:
+            pending = len(self._sync_queue)
+            self._sync_queue.clear()
+        if pending:
+            logger.warning(
+                "mem0_hermes: %d queued turn(s) were not extracted before "
+                "shutdown", pending,
+            )
+
+    def sync_idle(self) -> bool:
+        """True when nothing is queued and no extraction is in flight."""
+        with self._sync_cond:
+            return not self._sync_queue and not self._sync_busy
 
     # -- Tools --------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [SEARCH_SCHEMA, ADD_SCHEMA, UPDATE_SCHEMA, DELETE_SCHEMA]
+        return [
+            SEARCH_SCHEMA, GET_ALL_SCHEMA, ADD_SCHEMA, UPDATE_SCHEMA, DELETE_SCHEMA,
+        ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         # Tool calls run inline on the agent loop (tool_executor.py), so this is
@@ -604,6 +812,43 @@ class Mem0HermesMemoryProvider(MemoryProvider):
                 for r in results
             ]
             return json.dumps({"results": items, "count": len(items)})
+
+        if tool_name == "mem0_get_all":
+            try:
+                limit = max(1, min(int(args.get("limit", 20)), 100))
+            except (TypeError, ValueError):
+                limit = 20
+            try:
+                offset = max(0, int(args.get("offset", 0)))
+            except (TypeError, ValueError):
+                offset = 0
+            try:
+                results, has_more = backend.get_all(
+                    filters=self._read_filters(), limit=limit, offset=offset
+                )
+                self._record_success()
+            except Exception as exc:
+                if not _is_client_error(exc):
+                    self._record_failure()
+                return _tool_error(f"Listing memories failed: {exc}")
+            if not results:
+                message = (
+                    "No memories past that offset."
+                    if offset
+                    else "No memories stored yet."
+                )
+                return json.dumps({"result": message})
+            items = [
+                {"id": r.get("id"), "memory": r.get("memory", "")} for r in results
+            ]
+            return json.dumps(
+                {
+                    "results": items,
+                    "count": len(items),
+                    "offset": offset,
+                    "has_more": has_more,
+                }
+            )
 
         if tool_name == "mem0_add":
             content = str(args.get("content") or "")

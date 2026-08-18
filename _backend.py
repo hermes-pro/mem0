@@ -28,7 +28,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -589,10 +589,10 @@ def build_memory(config: Dict[str, Any]):
     from ._hermes_llm import HermesRoutedLLM, RoutedLlmConfig, register_with_mem0
 
     memory_config = build_memory_config(config)
-    _settings = _concurrency_settings(config)
+    settings = _concurrency_settings(config)
     _reset_collection_if_dims_changed(
         memory_config["vector_store"],
-        retries=_settings["retries"], backoff=_settings["backoff"],
+        retries=settings["retries"], backoff=settings["backoff"],
     )
 
     from mem0.configs.base import MemoryConfig
@@ -613,7 +613,6 @@ def build_memory(config: Dict[str, Any]):
         injected = False
 
     store_path = local_store_path(config)
-    settings = _concurrency_settings(config)
     try:
         with _retrying_local_client(settings["retries"], settings["backoff"]):
             if injected:
@@ -799,6 +798,26 @@ class HermesRoutedMem0Backend:
             return _unwrap_results(
                 self._memory.search(query, filters=filters, top_k=top_k, rerank=rerank)
             )
+
+    def get_all(
+        self, *, filters: dict, limit: int = 20, offset: int = 0
+    ) -> Tuple[List[dict], bool]:
+        """A window of stored memories, plus whether more follow it.
+
+        Mem0 exposes no cursor: ``Memory.get_all`` takes only ``top_k``, and the
+        Qdrant store's ``list`` throws away the ``next_page_offset`` that
+        ``client.scroll`` hands back. Reaching past Mem0 to the raw client is
+        not an option either — between leases that client is deliberately
+        closed. So the window is sliced from an over-fetch, which costs
+        ``offset`` extra rows per page and means paging is only stable while
+        nothing writes to the store in between. One row beyond the window is
+        fetched to tell "exactly a full page" from "there is more".
+        """
+        fetch = offset + limit + 1
+        with self._store():
+            results = _unwrap_results(self._memory.get_all(filters=filters, top_k=fetch))
+        window = results[offset : offset + limit]
+        return window, len(results) > offset + limit
 
     def add(
         self,

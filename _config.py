@@ -39,10 +39,13 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 # Sentinel user_id. Treated as "operator did not configure one", so the
 # gateway-native id (Telegram numeric id, Discord snowflake, …) still wins.
@@ -91,11 +94,28 @@ DEFAULT_FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
 # test run can never mutate the interpreter it happens to be running under.
 NO_INSTALL_ENV = "MEM0_HERMES_NO_INSTALL"
 
+# One entry per EMBEDDER_CHOICES provider, so the wizard can offer a working
+# model for whatever the user picks instead of an empty prompt. Values are
+# Mem0 2.x's own per-embedder defaults (mem0/embeddings/*.py), except where a
+# smaller model is deliberately preferred — see DEFAULT_FASTEMBED_MODEL.
 EMBEDDER_DEFAULT_MODEL: Dict[str, str] = {
     "fastembed": DEFAULT_FASTEMBED_MODEL,
     "openai": "text-embedding-3-small",
     "ollama": "nomic-embed-text",
     "huggingface": "sentence-transformers/all-MiniLM-L6-v2",
+    # Azure resolves the deployment, not the model name, but the width still
+    # has to be right and deployments usually mirror the model they serve.
+    "azure_openai": "text-embedding-3-small",
+    "gemini": "models/gemini-embedding-001",
+    "together": "intfloat/multilingual-e5-large-instruct",
+    "aws_bedrock": "amazon.titan-embed-text-v1",
+    # Deliberately absent from KNOWN_DIMS: Mem0 declares 1536 for this model
+    # while nomic-embed-text-v1.5 is natively 768, and which one LM Studio
+    # actually serves depends on how the GGUF is loaded. Leaving the width
+    # unstated defers to Mem0 rather than committing to a guess — a wrong
+    # embedding_dims doesn't fail loudly, it builds a mis-sized collection and
+    # then fails every write.
+    "lmstudio": "nomic-ai/nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.f16.gguf",
 }
 
 # Python packages each embedder needs, installed only for the provider actually
@@ -126,6 +146,12 @@ KNOWN_DIMS: Dict[str, int] = {
     "intfloat/multilingual-e5-large": 1024,
     "sentence-transformers/all-MiniLM-L6-v2": 384,
     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2": 384,
+    "multi-qa-MiniLM-L6-cos-v1": 384,
+    # Requested explicitly by Mem0 via output_dimensionality; the model can
+    # emit wider vectors, so this is not a property of the model alone.
+    "models/gemini-embedding-001": 768,
+    "intfloat/multilingual-e5-large-instruct": 1024,
+    "amazon.titan-embed-text-v1": 1536,
 }
 EMBEDDER_BASE_URL_KEY: Dict[str, str] = {
     "openai": "openai_base_url",
@@ -304,15 +330,45 @@ def _env_overrides() -> Dict[str, Any]:
         ("MEM0_HERMES_LLM_PROVIDER", "provider"),
         ("MEM0_HERMES_LLM_MODEL", "model"),
         ("MEM0_HERMES_LLM_BASE_URL", "base_url"),
+        ("MEM0_HERMES_LLM_API_KEY", "api_key"),
         ("MEM0_HERMES_LLM_TASK", "task"),
         ("MEM0_HERMES_JSON_MODE", "json_mode"),
     ):
         value = os.environ.get(env_name, "").strip()
         if value:
             llm[key] = value
+
+    for env_name, key, cast in (
+        ("MEM0_HERMES_LLM_TEMPERATURE", "temperature", float),
+        ("MEM0_HERMES_LLM_MAX_TOKENS", "max_tokens", int),
+        ("MEM0_HERMES_LLM_TIMEOUT", "timeout", float),
+    ):
+        number = _env_number(env_name, cast)
+        if number is not None:
+            llm[key] = number
+
     if llm:
         out["llm"] = llm
     return out
+
+
+def _env_number(env_name: str, cast) -> Any:
+    """Parse a numeric env override, or ``None`` when unset or unparseable.
+
+    A malformed value is reported rather than dropped: environment overrides
+    exist to be set from shell profiles and unit files, where a typo would
+    otherwise take effect as "the default" with nothing to point at.
+    """
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return None
+    try:
+        return cast(raw)
+    except ValueError:
+        logger.warning(
+            "mem0_hermes: ignoring %s=%r — expected %s", env_name, raw, cast.__name__
+        )
+        return None
 
 
 def _drop_inherited_dims(base: Dict[str, Any], overlay: Dict[str, Any]) -> None:
@@ -680,6 +736,37 @@ def _write_config(path: Path, data: Dict[str, Any]) -> None:
             pass
 
 
+_OK_MARK = "\u2713"    # ✓
+_WARN_MARK = "\u26a0"  # ⚠
+# Plain-ASCII stand-ins for consoles that cannot encode the marks above.
+_ASCII_MARKS = {_OK_MARK: "OK", _WARN_MARK: "!"}
+
+
+def _emit(log, message: str) -> None:
+    """Write one progress line, degrading the status mark if it can't encode.
+
+    ``hermes memory setup`` passes ``print``, and a Windows console still on
+    cp1252 raises ``UnicodeEncodeError`` on ✓ / ⚠. That is not a cosmetic
+    failure: it propagates out of ``save_config`` *after* the config file has
+    been written and the embedder install attempted, so the wizard dies partway
+    through a step it had actually completed, and the user sees a traceback
+    instead of the result.
+    """
+    try:
+        log(message)
+        return
+    except UnicodeEncodeError:
+        pass
+    for mark, plain in _ASCII_MARKS.items():
+        message = message.replace(mark, plain)
+    try:
+        log(message)
+    except UnicodeEncodeError:
+        # Something else in the line is unencodable — a package name or a path
+        # out of our hands. Losing a character beats losing the wizard.
+        log(message.encode("ascii", "replace").decode("ascii"))
+
+
 def save_config(
     values: Dict[str, Any], home: Path, *, install: bool = True, log=print
 ) -> Path:
@@ -707,16 +794,20 @@ def save_config(
     effective = load_config(root)
     missing = embedder_pip_requirements(effective)
     if missing:
-        log(f"  Installing {embedder_provider(effective)} embedder: {', '.join(missing)}")
+        _emit(
+            log,
+            f"  Installing {embedder_provider(effective)} embedder: "
+            f"{', '.join(missing)}",
+        )
         ok, message = ensure_embedder_dependencies(effective)
         if message:
-            log(f"  {'✓' if ok else '⚠'} {message}")
+            _emit(log, f"  {_OK_MARK if ok else _WARN_MARK} {message}")
 
     # With fastembed now importable, take its registry's word for the vector
     # width instead of the table in this module.
     changed, note = sync_fastembed_dims(effective)
     if note:
-        log(f"  {'✓' if changed else '⚠'} {note}")
+        _emit(log, f"  {_OK_MARK if changed else _WARN_MARK} {note}")
     if changed:
         block = (effective.get("embedder") or {}).get("config") or {}
         _assign(merged, "embedder.provider", embedder_provider(effective))

@@ -20,6 +20,7 @@ Use the Hermes venv's interpreter to include the Mem0 integration test:
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import importlib.util
 import os
@@ -59,7 +60,16 @@ def _install_memory_provider_stub() -> None:
     class MemoryProvider:  # noqa: D401 - stub mirrors the real ABC loosely
         """Stub stand-in for the real MemoryProvider ABC."""
 
+    @dataclasses.dataclass(frozen=True)
+    class RecallStatus:
+        """Mirrors agent.memory_provider.RecallStatus, including its default."""
+
+        provider_label: str
+        count: int
+        glyph: str = "🧠"
+
     module.MemoryProvider = MemoryProvider  # type: ignore[attr-defined]
+    module.RecallStatus = RecallStatus  # type: ignore[attr-defined]
     sys.modules["agent.memory_provider"] = module
     agent_pkg.memory_provider = module  # type: ignore[attr-defined]
 

@@ -161,10 +161,27 @@ checkout directory name doesn't matter; the destination is always
 
 Config resolution, lowest precedence first: built-in defaults → an existing
 bundled-`mem0` OSS setup in `mem0.json` (embedder + vector store + ids, so you
-keep reading the same memories) → `mem0_hermes.json` → environment
-(`MEM0_HERMES_LLM_MODEL`, `MEM0_HERMES_LLM_PROVIDER`, `MEM0_HERMES_USER_ID`,
-`MEM0_HERMES_AGENT_ID`, `MEM0_HERMES_JSON_MODE`, …; the bundled `MEM0_USER_ID` /
-`MEM0_AGENT_ID` are honored too).
+keep reading the same memories) → `mem0_hermes.json` → environment.
+
+Every `llm` key has an environment override, so the whole extraction route can
+be set from a shell profile or a unit file without writing the config file:
+
+| Variable | Sets |
+| --- | --- |
+| `MEM0_HERMES_USER_ID` | `user_id` (the bundled `MEM0_USER_ID` is honored too) |
+| `MEM0_HERMES_AGENT_ID` | `agent_id` (likewise `MEM0_AGENT_ID`) |
+| `MEM0_HERMES_LLM_PROVIDER` | `llm.provider` |
+| `MEM0_HERMES_LLM_MODEL` | `llm.model` |
+| `MEM0_HERMES_LLM_BASE_URL` | `llm.base_url` |
+| `MEM0_HERMES_LLM_API_KEY` | `llm.api_key` |
+| `MEM0_HERMES_LLM_TASK` | `llm.task` |
+| `MEM0_HERMES_JSON_MODE` | `llm.json_mode` |
+| `MEM0_HERMES_LLM_TEMPERATURE` | `llm.temperature` |
+| `MEM0_HERMES_LLM_MAX_TOKENS` | `llm.max_tokens` |
+| `MEM0_HERMES_LLM_TIMEOUT` | `llm.timeout` |
+
+The three numeric ones are parsed as numbers; an unparseable value is logged and
+ignored rather than silently taking effect as the default.
 
 ### Choosing the extraction model
 
@@ -211,7 +228,8 @@ of. Measured on this machine with the fastembed default:
 | First turn's `prefetch()` | up to the build (~1.5 s), capped at 3 s | Waits for the backend so the first turn still gets recall |
 | Later `prefetch()` | ~22 ms, off the hot path | Started at `on_turn_start`, consumed when the turn needs it |
 | `mem0_add` / `mem0_search` tool call | ~15–25 ms | Runs inline on the agent loop. Over half of it is reopening the leased store, which grows with the store — see [`lease_idle_release`](#lease_idle_release--paying-the-reopen-once-per-turn) |
-| `sync_turn` (extraction) | 0 ms on the loop | Background thread; the LLM call happens there |
+| `sync_turn` (extraction) | 0 ms on the loop | Queued to a single background worker; the LLM call happens there. Turns that arrive mid-extraction wait their turn rather than being dropped, up to a backlog of 8 |
+| `recall_status()` | 0 ms | Reports what the last prefetch injected, so the agent can show `🧠 Mem0 — recalled N memories` without relying on the model to mention it |
 
 The build isn't free, it's just moved somewhere it overlaps with the user typing
 their first message. Worst case — a message submitted the instant the session
@@ -354,10 +372,19 @@ too:
 3. Ask the agent to recall something from a previous session; `mem0_search`
    should return it.
 
-Tools exposed to the model (same names as the bundled plugin, so prompting and
-habits carry over): `mem0_search`, `mem0_add`, `mem0_update`, `mem0_delete`.
-`mem0_add` stores verbatim (`infer=False`) and spends no LLM call; turn-level
-extraction is what runs on your model, in a background thread after each turn.
+Tools exposed to the model (the bundled plugin's four names are unchanged, so
+prompting and habits carry over): `mem0_search`, `mem0_get_all`, `mem0_add`,
+`mem0_update`, `mem0_delete`. `mem0_add` stores verbatim (`infer=False`) and
+spends no LLM call; turn-level extraction is what runs on your model, in a
+background worker after each turn.
+
+`mem0_get_all` lists memories without a query — what you want when the user asks
+"what do you know about me?" or wants to prune. It takes `limit` (default 20,
+max 100) and `offset`, and reports `has_more`. Paging is sliced client-side:
+Mem0's `get_all` accepts only `top_k` and its Qdrant store discards the
+`next_page_offset` that `scroll` returns, so each page over-fetches `offset`
+extra rows and a write landing between two pages can shift the window. Fine for
+reviewing a store; don't build a paginated UI on it.
 
 ## Migrating from the bundled `mem0` plugin
 
