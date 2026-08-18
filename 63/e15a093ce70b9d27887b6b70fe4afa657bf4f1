@@ -1,0 +1,21 @@
+.github/workflows/tests.yml
+  s_6bd900efec2edd::t_dbcdf8bdcea733 1-43
+CONTRIBUTING.md
+  s_6bd900efec2edd::t_2fa39d9460c574 70-77
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "63e15a093ce70b9d27887b6b70fe4afa657bf4f1",
+  "prompts": {},
+  "sessions": {
+    "s_6bd900efec2edd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57c3bc92-80ac-4b0c-85c0-f9204abd3a76",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
