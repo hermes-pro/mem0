@@ -1,0 +1,22 @@
+README.md
+  s_6bd900efec2edd::t_e8d4ebc6990a74 412,429,458-464
+  s_6bd900efec2edd::t_36ab5ca92fd34a 465
+__init__.py
+  s_6bd900efec2edd::t_e8d4ebc6990a74 5-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "176780b3c687b64db9cafd590bcdfe02891272ab",
+  "prompts": {},
+  "sessions": {
+    "s_6bd900efec2edd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57c3bc92-80ac-4b0c-85c0-f9204abd3a76",
+        "model": "claude-opus-5"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
