@@ -30,6 +30,23 @@ def _is_managed_env(key):
     return key.startswith(_ENV_PREFIXES) and key not in _ENV_KEEP
 
 
+class Cp1252Log:
+    """A log sink that behaves like print() to a legacy Windows console.
+
+    cp1252 is still the default console encoding on Windows for Python <3.15
+    without UTF-8 mode, and encoding a character it lacks raises rather than
+    substituting. Simulating it here means the regression is caught on every
+    platform CI runs, not only the Windows legs.
+    """
+
+    def __init__(self):
+        self.lines = []
+
+    def __call__(self, message):
+        message.encode("cp1252")
+        self.lines.append(message)
+
+
 class TempHomeTestCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -328,6 +345,36 @@ class WizardTests(TempHomeTestCase):
                 else:
                     self.assertIsInstance(dims, int)
                     self.assertGreater(dims, 0)
+
+    def test_emit_degrades_the_status_marks_it_cannot_encode(self):
+        log = Cp1252Log()
+        _config._emit(log, f"  {_config._OK_MARK} installed fastembed")
+        _config._emit(log, f"  {_config._WARN_MARK} could not install")
+        self.assertEqual(
+            log.lines, ["  OK installed fastembed", "  ! could not install"]
+        )
+
+    def test_emit_passes_encodable_lines_through_unchanged(self):
+        log = Cp1252Log()
+        _config._emit(log, "  Installing fastembed embedder: fastembed>=0.3.1")
+        self.assertEqual(log.lines, ["  Installing fastembed embedder: fastembed>=0.3.1"])
+
+    def test_emit_survives_other_unencodable_characters(self):
+        log = Cp1252Log()
+        _config._emit(log, f"  {_config._OK_MARK} \u4e2d\u6587 model")
+        self.assertEqual(len(log.lines), 1)
+        self.assertIn("OK", log.lines[0])
+
+    def test_save_config_survives_a_cp1252_console(self):
+        # The wizard passes print. A UnicodeEncodeError here escapes
+        # save_config after the config was already written and the embedder
+        # install attempted, killing the wizard mid-step.
+        log = Cp1252Log()
+        _config.save_config({"embedder_provider": "fastembed"}, self.home, log=log)
+        saved = json.loads(
+            (self.home / _config.CONFIG_FILENAME).read_text(encoding="utf-8")
+        )
+        self.assertEqual(saved["embedder"]["provider"], "fastembed")
 
     def test_schema_covers_wizard_keys(self):
         keys = {field["key"] for field in _config.config_schema(_config.default_config(self.home))}

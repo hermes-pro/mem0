@@ -736,6 +736,37 @@ def _write_config(path: Path, data: Dict[str, Any]) -> None:
             pass
 
 
+_OK_MARK = "\u2713"    # ✓
+_WARN_MARK = "\u26a0"  # ⚠
+# Plain-ASCII stand-ins for consoles that cannot encode the marks above.
+_ASCII_MARKS = {_OK_MARK: "OK", _WARN_MARK: "!"}
+
+
+def _emit(log, message: str) -> None:
+    """Write one progress line, degrading the status mark if it can't encode.
+
+    ``hermes memory setup`` passes ``print``, and a Windows console still on
+    cp1252 raises ``UnicodeEncodeError`` on ✓ / ⚠. That is not a cosmetic
+    failure: it propagates out of ``save_config`` *after* the config file has
+    been written and the embedder install attempted, so the wizard dies partway
+    through a step it had actually completed, and the user sees a traceback
+    instead of the result.
+    """
+    try:
+        log(message)
+        return
+    except UnicodeEncodeError:
+        pass
+    for mark, plain in _ASCII_MARKS.items():
+        message = message.replace(mark, plain)
+    try:
+        log(message)
+    except UnicodeEncodeError:
+        # Something else in the line is unencodable — a package name or a path
+        # out of our hands. Losing a character beats losing the wizard.
+        log(message.encode("ascii", "replace").decode("ascii"))
+
+
 def save_config(
     values: Dict[str, Any], home: Path, *, install: bool = True, log=print
 ) -> Path:
@@ -763,16 +794,20 @@ def save_config(
     effective = load_config(root)
     missing = embedder_pip_requirements(effective)
     if missing:
-        log(f"  Installing {embedder_provider(effective)} embedder: {', '.join(missing)}")
+        _emit(
+            log,
+            f"  Installing {embedder_provider(effective)} embedder: "
+            f"{', '.join(missing)}",
+        )
         ok, message = ensure_embedder_dependencies(effective)
         if message:
-            log(f"  {'✓' if ok else '⚠'} {message}")
+            _emit(log, f"  {_OK_MARK if ok else _WARN_MARK} {message}")
 
     # With fastembed now importable, take its registry's word for the vector
     # width instead of the table in this module.
     changed, note = sync_fastembed_dims(effective)
     if note:
-        log(f"  {'✓' if changed else '⚠'} {note}")
+        _emit(log, f"  {_OK_MARK if changed else _WARN_MARK} {note}")
     if changed:
         block = (effective.get("embedder") or {}).get("config") or {}
         _assign(merged, "embedder.provider", embedder_provider(effective))
