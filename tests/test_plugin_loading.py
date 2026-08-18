@@ -79,7 +79,14 @@ class LoaderTests(unittest.TestCase):
             self.assertEqual(schema["parameters"]["type"], "object")
             names.append(schema["name"])
         self.assertEqual(
-            names, ["mem0_search", "mem0_add", "mem0_update", "mem0_delete"]
+            names,
+            [
+                "mem0_search",
+                "mem0_get_all",
+                "mem0_add",
+                "mem0_update",
+                "mem0_delete",
+            ],
         )
 
     def test_tool_calls_fail_cleanly_before_initialize(self):
@@ -119,7 +126,14 @@ class LoaderTests(unittest.TestCase):
         import sys
 
         module = sys.modules["_hermes_user_memory.mem0_hermes"]
-        collector = _ProviderCollector()
+        # _ProviderCollector gained a required `name` argument; accept either
+        # signature so the suite tracks whichever Hermes the user has.
+        import inspect
+
+        if "name" in inspect.signature(_ProviderCollector).parameters:
+            collector = _ProviderCollector("mem0_hermes")
+        else:
+            collector = _ProviderCollector()
         module.register(collector)
         self.assertIsNotNone(collector.provider)
         self.assertEqual(collector.provider.name, "mem0_hermes")
