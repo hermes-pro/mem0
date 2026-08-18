@@ -599,7 +599,11 @@ class TurnLifecycleTests(ProviderTestCase):
             messages=[
                 {"role": "user", "content": "an old turn"},
                 {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
-                {"role": "tool", "content": "/etc/passwd contents"},
+                # Deliberately shaped like a fact about the user. A tool
+                # result that reads as one is the actual poisoning risk here,
+                # and it makes the assertion below mean something: extraction
+                # must not pick up "lives in Berlin" from a config dump.
+                {"role": "tool", "content": "config.yaml: timezone = Europe/Berlin"},
                 {"role": "user", "content": "I drink dark roast"},
                 {"role": "assistant", "content": "Noted."},
             ],
