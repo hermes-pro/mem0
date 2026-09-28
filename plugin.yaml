@@ -8,3 +8,6 @@ license: Apache-2.0 OR MIT
 homepage: https://github.com/hermes-pro/mem0
 pip_dependencies:
   - mem0ai>=2.0.10,<3
+  # Hermes PM only persists declared dependencies across environment rebuilds.
+  # fastembed is the keyless default; its model weights still download lazily.
+  - fastembed>=0.3.1

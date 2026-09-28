@@ -118,11 +118,13 @@ EMBEDDER_DEFAULT_MODEL: Dict[str, str] = {
     "lmstudio": "nomic-ai/nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.f16.gguf",
 }
 
-# Python packages each embedder needs, installed only for the provider actually
-# selected (see ensure_embedder_dependencies). ``fastembed>=0.3.1`` matches the
-# constraint in mem0ai's own ``extras`` extra, so this can't fight Mem0's
-# resolver — and it doubles as enabling Mem0's BM25 keyword search, which is
-# skipped when fastembed is absent.
+# Python packages each embedder needs. The keyless default, fastembed, is also a
+# declared plugin dependency: current Hermes PM rebuilds environments only from
+# plugin.yaml/pyproject declarations, while its legacy ``install_specs`` shim
+# merely requests a relaunch. Keeping it here preserves the repair path on older
+# Hermes releases and in development environments. Non-default local embedders
+# remain selection-scoped. ``fastembed>=0.3.1`` matches mem0ai's own ``extras``
+# constraint and enables Mem0's BM25 keyword search.
 EMBEDDER_PIP_DEPS: Dict[str, tuple] = {
     "fastembed": ("fastembed>=0.3.1",),
     "ollama": ("ollama",),
@@ -458,15 +460,15 @@ def embedder_pip_requirements(config: Dict[str, Any]) -> tuple:
 def ensure_embedder_dependencies(config: Dict[str, Any]) -> tuple:
     """Install the selected embedder's packages. Returns ``(ok, message)``.
 
-    Declaring these in ``plugin.yaml`` isn't an option: ``hermes memory setup``
-    installs manifest dependencies *before* walking the config schema, so it
-    would download every embedder's stack — including fastembed's ONNX runtime —
-    for users who picked OpenAI. Installing per selection keeps the cost on the
-    provider actually chosen.
+    The default fastembed package is declared in ``plugin.yaml`` because current
+    Hermes PM treats that declaration as the durable dependency source. Its
+    model weights are still downloaded only on first use. Declaring every local
+    embedder would pull much larger stacks before the wizard knows which one the
+    user selected, so alternatives remain selection-scoped here.
 
-    Routed through ``tools.lazy_deps.install_specs``, which is what the memory
-    setup wizard itself uses: venv-scoped, redirected to the durable target on
-    sealed images, and gated by ``security.allow_lazy_installs``.
+    On Hermes releases that still expose the lazy dependency installer, this is
+    venv-scoped and gated by ``security.allow_lazy_installs``. On current PM
+    releases fastembed is already importable before this path is reached.
     """
     missing = embedder_pip_requirements(config)
     if not missing:
