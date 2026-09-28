@@ -1,0 +1,30 @@
+_config.py
+  s_a4d703d23e29c7::t_6d542f3f199962 121-127,463-467,469-471
+README.md
+  s_a4d703d23e29c7::t_19443ec02788d2 19-20
+  s_a4d703d23e29c7::t_6d542f3f199962 17-18,76-82,404,422
+CONTRIBUTING.md
+  s_a4d703d23e29c7::t_6d542f3f199962 93-99
+plugin.yaml
+  s_a4d703d23e29c7::t_6d542f3f199962 11-13
+AGENTS.md
+  s_a4d703d23e29c7::t_6d542f3f199962 24,92-99
+tests/test_plugin_loading.py
+  s_a4d703d23e29c7::t_6d542f3f199962 109-123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "19328d67a4d62d6500bac756170dbe5493875788",
+  "prompts": {},
+  "sessions": {
+    "s_a4d703d23e29c7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e9b1-87fb-74c0-b4e2-c0b0f60bed55",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "LZL0 <12474488+LZL0@users.noreply.github.com>"
+    }
+  }
+}
