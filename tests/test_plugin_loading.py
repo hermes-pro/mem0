@@ -106,6 +106,21 @@ class ScannerCriticalPatternTests(unittest.TestCase):
         )
 
 
+class ManifestDependencyTests(unittest.TestCase):
+    def test_default_fastembed_dependency_is_durable(self):
+        """Hermes PM rebuilds only dependencies declared by the plugin."""
+        manifest = (REPO_ROOT / "plugin.yaml").read_text(encoding="utf-8")
+        dependencies = {
+            line.strip()[2:]
+            for line in manifest.splitlines()
+            if line.strip().startswith("- ")
+        }
+        self.assertTrue(
+            any(spec.startswith("fastembed>=") for spec in dependencies),
+            "the default embedder must survive Hermes PM environment rebuilds",
+        )
+
+
 def _loader_available() -> bool:
     if not _bootstrap.HERMES_AGENT_AVAILABLE:
         return False

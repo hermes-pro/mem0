@@ -21,7 +21,7 @@ hermes-pro/mem0` finds it.
 ## Layout
 
 ```
-plugin.yaml            # manifest: name: mem0_hermes, kind: exclusive, mem0ai dep
+plugin.yaml            # manifest: identity plus durable mem0ai/fastembed deps
 __init__.py            # Mem0HermesMemoryProvider: lifecycle, tools, prefetch, breaker
 _hermes_llm.py         # HermesRoutedLLM -> agent.auxiliary_client.call_llm
 _backend.py            # builds Mem0 Memory with the routed LLM; Qdrant leasing, history.db
@@ -89,11 +89,14 @@ edited.
   providers first, so a directory named `mem0` would be shadowed by the bundled
   plugin and never load.
 - **Do not move the plugin into a subdirectory.**
-- **No new unconditional runtime dependencies.** `mem0ai` is the only declared
-  one. Embedder packages install per selection via
-  `ensure_embedder_dependencies`, because `hermes memory setup` installs
-  `plugin.yaml` dependencies *before* the user picks an embedder. Anything else
-  must be optional and lazily imported.
+- **No new unconditional runtime dependencies beyond `mem0ai` and the default
+  `fastembed`.** Hermes PM persists only dependencies declared in
+  `plugin.yaml`/`pyproject.toml`; its legacy `tools.lazy_deps.install_specs`
+  compatibility shim requests a relaunch but does not add arbitrary packages.
+  The keyless default therefore has to be declared (its model weights still
+  download only on first use). Non-default embedder packages remain
+  selection-scoped via `ensure_embedder_dependencies`. Anything else must be
+  optional and lazily imported.
 - **The test suite must never install anything.** `tests/_bootstrap.py` sets
   `MEM0_HERMES_NO_INSTALL=1`, which makes `ensure_embedder_dependencies` refuse
   to run pip. Tests that exercise the install path patch

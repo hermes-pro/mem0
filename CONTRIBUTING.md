@@ -90,12 +90,13 @@ A few constraints aren't obvious from reading a single file:
   installed directory name, and Hermes resolves `memory.provider` against
   bundled providers first — a directory named `mem0` would be shadowed by the
   bundled Mem0 plugin and never load.
-- **No new unconditional runtime dependencies.** `mem0ai` is the only declared
-  one. Embedder packages (`fastembed`, `ollama`, `sentence-transformers`) are
-  installed per selection via `ensure_embedder_dependencies`, because
-  `hermes memory setup` installs `plugin.yaml` dependencies *before* the user
-  picks an embedder — declaring them there would download every embedder's stack
-  for everyone. Anything else must be optional and lazily imported.
+- **No new unconditional runtime dependencies beyond `mem0ai` and the default
+  `fastembed`.** Hermes PM persists only declared plugin dependencies, so the
+  keyless default must live in `plugin.yaml`; its model weights still download
+  only on first use. Non-default embedder packages (`ollama`,
+  `sentence-transformers`) remain selection-scoped via
+  `ensure_embedder_dependencies`. Anything else must be optional and lazily
+  imported.
 - **The test suite must never install anything.** `tests/_bootstrap.py` sets
   `MEM0_HERMES_NO_INSTALL=1`, which makes `ensure_embedder_dependencies` refuse
   to run pip. Tests that need to exercise the install path patch

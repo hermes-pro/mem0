@@ -14,9 +14,10 @@ hermes plugins install hermes-pro/mem0 --no-enable
 hermes memory setup                      # pick mem0_hermes, choose an embedder
 ```
 
-`hermes memory setup` installs `mem0ai` plus the embedder you select (the
-default, `fastembed`, runs locally), your answers saved to `$HERMES_HOME/mem0_hermes.json`.  
-  
+The plugin declares `mem0ai` and the keyless default `fastembed` so Hermes PM
+keeps both across environment rebuilds. `hermes memory setup` saves your answers
+to `$HERMES_HOME/mem0_hermes.json`.
+
 Start a new session to activate.
 
 ## Updating and uninstalling:
@@ -72,14 +73,13 @@ plugin is for, since a Codex/OAuth setup has no `OPENAI_API_KEY` to fall back on
 | `openai` | `OPENAI_API_KEY` | `text-embedding-3-small`; embeddings only, never generation |
 | `huggingface`, `azure_openai`, `gemini`, `lmstudio`, `together`, `aws_bedrock` | varies | Passed through to Mem0 |
 
-`hermes memory setup` installs whichever embedder you pick, at the moment you
-pick it — `fastembed` pulls `fastembed>=0.3.1` (matching mem0ai's own `extras`
-constraint), `ollama` pulls `ollama`, `huggingface` pulls
-`sentence-transformers`. Hosted embedders need no package. The install goes
-through Hermes's own gated installer, so it honors
-`security.allow_lazy_installs` and the durable-target redirect on sealed images.
-Installing fastembed also switches Mem0's BM25 keyword search on, which it
-otherwise skips.
+`fastembed>=0.3.1` is a declared plugin dependency (matching mem0ai's own
+`extras` constraint), because Hermes PM only carries declared dependencies into
+the next environment generation. Its 67 MB model weights still download only
+when fastembed is first used. Alternate local embedders remain selection-scoped:
+`ollama` needs `ollama`, and `huggingface` needs `sentence-transformers`. Hosted
+embedders need no package. Installing fastembed also switches Mem0's BM25
+keyword search on, which it otherwise skips.
 
 Vector widths are read back from fastembed's own model registry after install
 and written into the config, so a wrong dimension can never silently create a
@@ -401,7 +401,7 @@ it replaces.
 | Symptom | Cause / fix |
 | --- | --- |
 | `backend not initialized: embedder provider 'openai' needs OPENAI_API_KEY` | You switched off the local default. Set the key, or `hermes memory setup` → embedder `fastembed`. |
-| `embedder 'fastembed' needs fastembed>=0.3.1` | Its package went missing — usually a rebuilt venv after `hermes update`. The next session reinstalls it automatically; if installs are gated off (`security.allow_lazy_installs: false`), `pip install fastembed` or re-run `hermes memory setup`. |
+| `embedder 'fastembed' needs fastembed>=0.3.1` | The installed plugin predates the declared dependency, or the Hermes environment is stale. Run `hermes plugins update mem0_hermes`; if it persists, run `hermes pm repair`. |
 | `fastembed does not offer model '…'` | Typo in `embedder.config.model`. The message lists valid names; setup checks this against fastembed's registry. |
 | `the local Qdrant store at … is held by another Qdrant client` | Another process owns the embedded store and isn't releasing it — often the bundled `mem0` plugin, or a Hermes instance with `lease_local_store: false`. Close it, or move to a Qdrant server. See [Multiple Hermes processes](#multiple-hermes-processes). Don't delete `.lock`. |
 | `sqlite3.OperationalError: database is locked` | A history write waited past `concurrency.sqlite_busy_timeout_ms` (15 s). Something is holding a long write transaction on `history.db` — look for a stuck process rather than raising the timeout further. |
@@ -419,7 +419,7 @@ finds `plugin.yaml` where it looks for it (and `hermes plugins update` can pull
 in place, since the clone's `.git` comes along).
 
 ```
-plugin.yaml            # manifest: name: mem0_hermes, kind: exclusive, mem0ai dep
+plugin.yaml            # manifest: identity plus durable mem0ai/fastembed deps
 __init__.py            # MemoryProvider: lifecycle, tools, prefetch, breaker
 _hermes_llm.py         # HermesRoutedLLM → agent.auxiliary_client.call_llm
 _backend.py            # builds Mem0 Memory with the routed LLM injected
